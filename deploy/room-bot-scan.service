@@ -1,0 +1,12 @@
+[Unit]
+Description=room_bot — разовый скан каналов (запускается таймером room-bot-scan.timer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Поменяй на реальный путь к проекту на VM
+WorkingDirectory=/opt/room_bot
+# Поменяй на реальный путь к venv, если venv называется иначе/лежит в другом месте
+ExecStart=/opt/room_bot/venv/bin/python room_bot.py
+EnvironmentFile=/etc/room-bot.env

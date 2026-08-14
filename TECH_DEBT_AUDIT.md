@@ -1,0 +1,83 @@
+# Tech Debt Audit — room_bot
+Generated: 2026-08-13
+Updated: 2026-08-13 — see "Fixed in this pass" below; F001, F004–F008, F010–F012 addressed.
+
+Scope: `room_bot.py` (2011 lines, sole application module), `config.json`, `state.json`, `setup_room_bot.ps1`, `requirements.txt`, `README.md`, `bot.log`. Not a git repository — no commit history/churn data available, so file-age/frequency signals below come from filesystem timestamps and log evidence instead of `git log`.
+
+## Executive summary
+
+- **Critical**: a live Telegram bot token and chat ID are hardcoded in plaintext in `setup_room_bot.ps1:9-10`.
+- **High**: the long-polling command listener (`--listen`) is not registered anywhere in the setup automation, yet `bot.log` shows it restarting 7 times between 18:02 and 18:31 on 2026-08-12 — something is repeatedly killing and relaunching it, which risks Telegram 409 Conflict errors the code itself warns about.
+- **High**: zero automated tests exist for the ~700 lines of regex-based extraction logic (price, address, metro, rooms) — the single most bug-prone, most-patched part of the codebase, evidenced by extensive inline "we fixed this exact bug before" comments.
+- **Medium**: the 5 Telegram API call functions duplicate the same request/error-log pattern; `process_commands()` and `listen_loop()` duplicate the same update-processing loop.
+- **Medium**: `README.md` describes a much simpler bot than what actually ships — no mention of the listener mode, the 10 chat commands, or the inline-button filters menu.
+- Nothing catastrophic in the extraction logic itself — the regex complexity is earned, not accidental (see "looks bad but is fine" below).
+- Given this is a ~2,000-line single-file personal script, not a multi-team codebase, the findings list below is proportionate rather than padded to a target count.
+
+## Architectural mental model
+
+`room_bot.py` is a single-file bot with four blended layers: (1) a large regex-based extraction engine that turns free-form Russian rental-ad text into structured fields (price, metro, floor, address, amenities...), (2) a Telegram Bot API client (send message/photo/album, edit keyboard, poll updates), (3) an in-place-mutated `config`/`state` global pair persisted to JSON, and (4) two separate entry points — a one-shot channel scan (`main()`, run via Task Scheduler every 15 min per `setup_room_bot.ps1`) and a long-running command listener (`--listen`, referenced in comments but not wired into any setup script). There's no test suite, no packaging, and no git history; the module docstring-level comments carry the design rationale instead of external docs. The architecture is reasonable for its scale — the debt is concentrated in duplication, missing tests, and a gap between what the code assumes about deployment (`RoomBotListener` task) and what's actually installed.
+
+## Findings
+
+| ID | Category | File:Line | Severity | Effort | Description | Recommendation |
+|----|----------|-----------|----------|--------|-------------|----------------|
+| F001 | Security hygiene | setup_room_bot.ps1:9-10 | Critical | S | Live `$BotToken` and `$ChatId` hardcoded in plaintext in a script sitting in the project folder. | Move both to environment variables/prompt at runtime, rotate the exposed token via @BotFather, keep the script token-free. |
+| F002 | Documentation drift | README.md (whole file) vs room_bot.py:1698-1877, 1962-1986 | High | M | README only documents the single-shot Task Scheduler flow from an early version. It has no mention of `--listen` mode, the 10 chat commands (`/price`, `/metro`, `/rooms`, ...), or the inline `⚙️ Настроить фильтры` button menu — the primary way filters are actually changed now. | Add a section documenting `--listen`, the command list (can reuse `HELP_TEXT`), and the button menu. |
+| F003 | Architectural decay / deployment | setup_room_bot.ps1 (no listener task) vs room_bot.py:1992-1995 comment referencing "RoomBotListener" | High | M | The comment in `main()` assumes a separate scheduled task runs `--listen` continuously, but `setup_room_bot.ps1` only registers one task (`RoomBot`, one-shot every 15 min). `bot.log` shows the listener logging "Слушатель команд запущен" 7 times in 30 minutes (18:02–18:31 on 08-12) — evidence it's being restarted, not running continuously as designed. Frequent restarts risk overlapping `getUpdates` calls and the 409 Conflict the code explicitly guards against. | Register a second Scheduled Task (trigger: at log-on/startup, no repetition, `-Restart` on failure) for `python room_bot.py --listen`, or run it as a Windows service; document the two-task setup in README. |
+| F004 | Consistency rot | room_bot.py:1472-1579 | Medium | M | `send_telegram_message`, `answer_callback_query`, `edit_message_reply_markup`, `send_telegram_photo`, `send_telegram_media_group` each independently build the `https://api.telegram.org/bot{BOT_TOKEN}/...` URL, `requests.post`, and a `try/except requests.RequestException: log(...)` block. | Extract a shared `_telegram_api(method, data=None, files=None, timeout=15)` helper; keep method-specific payload shaping in the thin wrappers. |
+| F005 | Consistency rot | room_bot.py:1948-1959 vs room_bot.py:1962-1986 | Medium | S | `process_commands()` and `listen_loop()` both fetch updates, loop them, track `max_update_id`, call `handle_update`, and save `state["last_update_id"]` — near-identical logic duplicated instead of `listen_loop` calling a shared "process one batch" function in a loop. | Factor the update-processing body into one function both entry points call. |
+| F006 | Performance & resource hygiene / concurrency | room_bot.py:1251-1270, 1648-1696 | Medium | S | `_schedule_recent_scan` fires a background `threading.Timer` that reads `config["channels"]`/`config["filters"]` (`send_recent_matching_ads`) while the main `listen_loop` thread can concurrently mutate and `save_json` that same `config` dict from another button press — no lock covers the read side, only the timer-replacement itself (`_scan_lock`). | Snapshot `filters`/`channels` into local variables before scheduling the timer, or extend `_scan_lock` around the read. |
+| F007 | Architectural decay | room_bot.py:1892-1938 | Low | S | A temporary calibration helper (captures `custom_emoji_id` for metro-line icons into `emoji_ids.log`) lives permanently inside the main `handle_update` hot path, intercepting *any* incoming message containing a custom emoji before normal command handling runs. `emoji_ids.log` shows it was still actively used on 2026-08-12. | Now that `METRO_LINE_EMOJI_ID` (room_bot.py:740-761) has ids for all 21 lines/MCD branches, remove this block or move it to a standalone one-off script gated by an env var. |
+| F008 | Dependency & config debt | requirements.txt:1-2 | Low | S | `requests` and `beautifulsoup4` are unpinned. | Pin versions (`requests==2.x.x`, `beautifulsoup4==4.x.x`) so a fresh `pip install` can't silently pull a breaking major version. |
+| F009 | Consistency rot | config.json:38-56 vs room_bot.py:1112-1121 | Low | S | `matches_filters` only falls back to `price_min`/`price_max` when `price_ranges` is empty (`elif` branch); `config.json` currently has both `price_max: 50000` *and* a populated `price_ranges` list, so `price_min`/`price_max` are silently dead as long as any range is selected via the button menu. | Either drop `price_min`/`price_max` from the schema once `price_ranges` exists, or document in `/filters` output that ranges take precedence. |
+| F010 | Test debt | room_bot.py:99-333 (price extraction), 930-958 (address extraction), 343-369 (metro extraction) | High | M | No test file anywhere in the project. This is the most intricate, most-patched part of the codebase — comments like room_bot.py:253-262 ("раньше '70 000 + 3 600 коммунальные' отдавало 3 600...") describe specific regressions that were fixed by hand and are now only protected by nothing. | Add a small `pytest`-based regression suite: one text sample per documented edge case in the surrounding comments, asserting `extract_price`/`extract_address`/`extract_metro_info` output. Even 20-30 cases lifted straight from the comments would lock in the current, hard-won behavior. |
+| F011 | Security hygiene | room_bot.py:1145, 1531, 1553 | Low | S | `PHOTO_URL_RE` extracts an arbitrary URL from a scraped `style="background-image:url(...)"` attribute with no host allow-list, and `send_telegram_photo`/`send_telegram_media_group` then `requests.get()` it directly. Impact is limited (public channels the user chose, response is only re-uploaded as a photo file), but there's no validation that the URL actually points at a Telegram CDN host. | Add a check that the extracted host matches `*.telesco.pe` (or similar) before fetching. |
+| F012 | Observability | room_bot.py:49 | Low | S | `log()` writes UTF-8; on Windows, `Get-Content`/`type` in a non-UTF-8 console renders Cyrillic log lines as mojibake, which makes `bot.log` hard to read directly (had to be re-read with a UTF-8-aware tool during this audit). | Not a code bug — note it in README ("read bot.log with a UTF-8-aware tool, not raw `type`/`Get-Content`") so it's not re-discovered as a false alarm later. |
+
+## Top 5 — if you fix nothing else, fix these
+
+1. **F001 — Get the bot token out of `setup_room_bot.ps1`.** It's sitting in plaintext in a script that isn't even under version control yet — the cheapest possible leak vector. Rotate the token via @BotFather once it's moved out, since the current one has already been on disk in plaintext.
+2. **F003 — Register the listener as its own persistent task.** The restart pattern in `bot.log` (7 restarts in 30 minutes) means the interactive filters menu and chat commands are running on borrowed time, not continuously as the code assumes. This is why buttons/commands might feel flaky to use.
+3. **F010 — Add a regression test file for the extraction functions.** The comments already contain the test cases (specific broken inputs and the fix rationale) — turning them into `assert` statements is mostly transcription, and it's the only thing currently stopping a "small tweak" from silently reintroducing an old bug.
+4. **F004 — Collapse the 5 Telegram API functions onto one request helper.** Low risk, mechanical change, removes ~40 duplicated lines and gives you one place to add retry/backoff later if the current timeout errors in `bot.log` continue.
+5. **F002 — Bring README up to date with what the bot actually does.** Right now the only complete command reference is `HELP_TEXT` inside the script itself; anyone (including future-you) reading README first would not know the button menu or `/price`-style commands exist.
+
+## Quick wins
+
+- [x] F001: Remove hardcoded token/chat_id from `setup_room_bot.ps1` (now prompts / reads from env). **Token still needs to be rotated via @BotFather by the maintainer** — it was on disk in plaintext.
+- [x] F008: Pin `requests`/`beautifulsoup4` versions in `requirements.txt`.
+- [ ] F009: Not changed — turned out to be intentional (see note in "Fixed in this pass").
+- [x] F007: Custom-emoji calibration helper now gated behind `ROOM_BOT_CAPTURE_EMOJI` env var.
+- [x] F012: Added a README note about reading `bot.log` with UTF-8.
+
+## Fixed in this pass (2026-08-13)
+
+- **F001** — `setup_room_bot.ps1` no longer contains a hardcoded token/chat_id; it reads `$env:TG_BOT_TOKEN`/`$env:TG_MY_CHAT_ID` or prompts once. **The previously-hardcoded token was exposed in plaintext and should still be rotated via @BotFather** — removing it from the file doesn't undo that exposure.
+- **F003** — `setup_room_bot.ps1` now also registers a `RoomBotListener` Scheduled Task (`--listen`, trigger at logon, auto-restart on failure) and starts it immediately, instead of leaving the listener unregistered.
+- **F004** — added `_telegram_api()` helper; `send_telegram_message`, `answer_callback_query`, `edit_message_reply_markup`, `send_telegram_photo`, `send_telegram_media_group` now share it instead of duplicating the request/error-log pattern.
+- **F005** — added `_process_update_batch()`; `process_commands()` and `listen_loop()` both call it instead of duplicating the update-processing loop.
+- **F006** — `_schedule_recent_scan` now snapshots `config["channels"]`/`config["filters"]` on the calling thread before starting the debounce timer, so the background scan no longer reads shared mutable `config` concurrently with a main-thread mutation.
+- **F007** — the custom-emoji capture block in `handle_update` is now gated behind `ROOM_BOT_CAPTURE_EMOJI` (unset by default), so a normal message containing a custom emoji no longer gets silently intercepted.
+- **F008** — `requirements.txt` pinned to `requests~=2.34`, `beautifulsoup4~=4.15`; added `requirements-dev.txt` with `pytest~=8.3`.
+- **F010** — added `tests/test_extract.py` (18 cases) covering price/address/metro/floor/area/room-type extraction and duplicate detection, derived from the edge cases already documented in code comments. Run with `python -m pytest tests/`.
+- **F011** — `extract_photo_urls` now only accepts URLs on `*.telesco.pe` before the bot downloads and re-uploads them.
+- **F012** — README now notes that `bot.log` is UTF-8 and should be read with a UTF-8-aware tool.
+- **F002** — README gained a "Шаг 7" section documenting `--listen`, the full command list, and the button menu, plus a "Тесты" section.
+- **F009 — investigated, not a bug.** `price_min`/`price_max` aren't dead: they're the fallback used when `price_ranges` is empty (e.g. after "Сбросить фильтры"), and `/filters` already displays whichever one is actually active. Left as-is.
+
+Not touched: **F013 (implicit)** — the actual cause of the listener's frequent restarts (7 times in 30 min on 08-12) wasn't diagnosed; registering `RoomBotListener` properly (F003) should fix it if the cause was "nothing was keeping it running," but if something else is killing the process, restarts may continue. Worth checking `bot.log` after this deploy.
+
+## Things that look bad but are actually fine
+
+- **The dense regex pile for price/address/metro extraction** (room_bot.py:99-450ish) looks like accidental complexity at first glance — many overlapping patterns, exclusion spans, negation lookback windows. But nearly every rule has an inline comment citing the exact real-world ad text that broke without it (e.g. "70 000 + 3 600 коммунальные" mis-parsing, "55.000ку" shorthand, "Без коммуналки и залога" negation). This is earned complexity for parsing free-form Russian classified ads, not over-engineering. Leave it — just add tests (F010) instead of trying to simplify it.
+- **Global mutable `config`/`state` dicts mutated in place from many functions** would be a red flag in a larger codebase, but this is a single-process, single-user personal script with no framework boundary to violate. Introducing classes/DI here would add ceremony without a corresponding benefit.
+- **Broad `except Exception` in the fetch/poll loops** (room_bot.py:1283, 1315, 1730, 1984) is normally too broad, but here it's deliberate self-healing behavior for a long-running network poller — a single bad response must not kill the whole bot — and every catch site logs with context before continuing.
+- **`html.escape()` applied to all scraped text before building HTML-mode Telegram messages** (room_bot.py:1391-1428) looks, on first read, like an XSS-shaped risk (building HTML strings from third-party scraped content). It's actually handled correctly and consistently — every interpolated field goes through `e = html.escape` first.
+- **~250 lines of hardcoded metro station/line data living inside `room_bot.py`** (lines 524-761) looks like it belongs in a separate data file. For a script this size, splitting it out would add an import for no real benefit yet — revisit only if a second file starts needing the same data.
+
+## Open questions for the maintainer
+
+- Is `--listen` currently being run manually in a terminal window (which would explain the frequent restarts in the log — e.g. the window getting closed/PC sleeping), or is there an undocumented second Scheduled Task with a short repeat interval that's inadvertently relaunching it? Worth checking Task Scheduler directly to see what's actually configured beyond `setup_room_bot.ps1`.
+- Now that all 21 metro lines/MCD branches have emoji ids in `METRO_LINE_EMOJI_ID`, is the custom-emoji capture helper (F007) still needed, or safe to remove?
+- Is keeping `price_min`/`price_max` alongside `price_ranges` (F009) intentional as a fallback for some future "no ranges selected, use raw min/max" mode, or leftover from before the button menu existed?

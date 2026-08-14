@@ -1,0 +1,17 @@
+[Unit]
+Description=room_bot — непрерывный слушатель команд/кнопок Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Поменяй на реальный путь к проекту на VM
+WorkingDirectory=/opt/room_bot
+# Поменяй на реальный путь к venv, если venv называется иначе/лежит в другом месте
+ExecStart=/opt/room_bot/venv/bin/python room_bot.py --listen
+EnvironmentFile=/etc/room-bot.env
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+state.json
+state.json.lock
+bot.log
+emoji_ids.log
+*.env
+out*.txt
+.claude/
