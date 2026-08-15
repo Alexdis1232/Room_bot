@@ -1508,6 +1508,22 @@ _pending_scan_timer = None
 _scan_lock = threading.Lock()
 
 
+def _run_recent_scan(channels, filters):
+    # запускается таймером в отдельном потоке (см. _schedule_recent_scan) —
+    # необработанное исключение здесь НЕ попадёт ни в try/except вокруг
+    # main() (он ловит только свой, главный поток), ни в лог: threading
+    # печатает traceback в sys.stderr, а планировщик запускает скрипт через
+    # pythonw.exe, у которого sys.stderr == None — печать в None сама падает
+    # с исключением и тихо тонет. Раньше любая ошибка при скане по кнопке
+    # "Применить" (например, сеть отвалилась на середине) означала полную
+    # тишину: ни сообщения с результатом, ни следа в bot.log
+    try:
+        send_recent_matching_ads(channels=channels, filters=filters)
+    except Exception as e:
+        log(f"Ошибка при скане по кнопке 'Применить': {e}")
+        send_telegram_message(f"Не удалось выполнить поиск по фильтру: {e}")
+
+
 def _schedule_recent_scan(delay=3.0):
     # сканирование каналов может занять много времени (постраничная
     # подгрузка истории), поэтому запускаем в фоновом потоке — иначе
@@ -1527,7 +1543,7 @@ def _schedule_recent_scan(delay=3.0):
             _pending_scan_timer.cancel()
         _pending_scan_timer = threading.Timer(
             delay,
-            send_recent_matching_ads,
+            _run_recent_scan,
             kwargs={"channels": channels_snapshot, "filters": filters_snapshot},
         )
         _pending_scan_timer.daemon = True
