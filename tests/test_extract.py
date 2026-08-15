@@ -490,3 +490,47 @@ def test_continuation_from_different_channel_is_not_merged():
     continuation = _fake_post(2, "Арендная плата: 100.000₽, @someone", channel="chanB")
     merged = rb._merge_price_continuation_posts([first, continuation])
     assert [p["id"] for p in merged] == [1, 2]
+
+
+def test_unrelated_post_with_bare_phone_number_is_not_merged():
+    # раньше "нет фото + нет типа жилья + есть хоть какой-то контакт" было
+    # достаточным условием для склейки — два совсем не связанных поста
+    # (продажа дивана и следующий пост с номером телефона в подписи) могли
+    # склеиться просто потому, что во втором нашёлся номер телефона
+    first = _fake_post(1, "Продам диван, самовывоз, отличное состояние", photos=["a.jpg"])
+    second = _fake_post(2, "Ремонт свежий, рядом парк, звоните 89161234567")
+    merged = rb._merge_price_continuation_posts([first, second])
+    assert [p["id"] for p in merged] == [1, 2]
+
+
+def test_double_post_merge_works_across_pagination_boundary():
+    # send_recent_matching_ads/фильтр "Применить" тянут историю канала
+    # постранично (fetch_channel_posts_since); склейка двойных постов
+    # раньше шла только ВНУТРИ одной страницы — если фото-пост и его
+    # продолжение с ценой попадали на границу двух страниц, каждая
+    # страница видела только половину пары, и склейка не срабатывала
+    import datetime as dt
+
+    def fake_fetch(channel, before=None):
+        if before is None:
+            # новая страница: только продолжение с ценой — фото-пост уже
+            # "утёк" на более старую (следующую) страницу
+            return [{
+                "id": 21, "channel": channel, "text": "Арендная плата: 100.000₽, звоните",
+                "photos": [], "datetime": None,
+            }]
+        return [{
+            "id": 20, "channel": channel, "text": "2-к квартира, метро Тестовая",
+            "photos": ["x.jpg"], "datetime": None,
+        }]
+
+    real_fetch = rb.fetch_channel_posts
+    rb.fetch_channel_posts = fake_fetch
+    try:
+        cutoff = dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc)
+        posts = rb.fetch_channel_posts_since("chanA", cutoff, max_pages=2)
+    finally:
+        rb.fetch_channel_posts = real_fetch
+
+    assert [p["id"] for p in posts] == [20]
+    assert rb.extract_price(posts[0]["text"]) == 100000

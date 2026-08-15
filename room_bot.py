@@ -1456,7 +1456,14 @@ def _looks_like_price_continuation(post):
         return False
     if extract_rooms(text_no_hashtags) is not None:
         return False
-    return extract_price(post["text"]) is not None or extract_contacts(post["text"]) is not None
+    # именно ЦЕНА, а не просто наличие контакта — "нет фото + нет типа
+    # жилья + есть номер телефона" слишком слабый сигнал сам по себе и
+    # раньше мог склеить два совсем не связанных поста подряд (например
+    # "Продам диван..." с фото и следующий пост "Ремонт свежий, звоните
+    # 89161234567", у которого просто оказался номер в тексте). Оба реально
+    # виденных случая двойного поста (Find_flat) несут цену в самом
+    # продолжении — контакт без цены рядом отдельно не считаем
+    return extract_price(post["text"]) is not None
 
 
 def _merge_price_continuation_posts(posts):
@@ -1562,7 +1569,15 @@ def fetch_channel_posts_since(channel, cutoff_dt, max_pages=15):
 
         before = min(p["id"] for p in page)
 
-    return all_posts
+    # склейка двойных постов (см. _merge_price_continuation_posts) идёт
+    # внутри fetch_channel_posts() постранично — если ровно такая пара
+    # (фото-пост + пост-продолжение с ценой) попадает на границу двух
+    # страниц, каждая страница видит только половину пары и склейка не
+    # происходит. all_posts копится страницами от новых к старым, а внутри
+    # страницы — от старых к новым, поэтому сортируем по id и склеиваем
+    # ещё раз уже по полному, правильно упорядоченному списку
+    all_posts.sort(key=lambda p: p["id"])
+    return _merge_price_continuation_posts(all_posts)
 
 
 _pending_scan_timer = None
