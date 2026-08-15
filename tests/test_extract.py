@@ -320,6 +320,70 @@ def test_hidden_avito_link_behind_text_is_picked_up_as_contact(monkeypatch):
     assert contacts == "https://www.avito.ru/moskva/kvartiry/1-k._kvartira_39_m_8302990329"
 
 
+def test_split_post_with_price_in_second_message_gets_merged(monkeypatch):
+    # канал иногда публикует одно объявление двумя подряд идущими
+    # сообщениями (упирается в ограничение длины поста Telegram) — цена
+    # уходит вторым сообщением. Без склейки первая карточка была бы без
+    # цены, хотя в исходном объявлении она есть
+    html = """
+    <div class="tgme_widget_message" data-post="testchan/10">
+      <div class="tgme_widget_message_text">
+        Сдаётся квартира 60 м², 2 комнаты, м. Преображенская площадь 10 мин
+      </div>
+      <time datetime="2026-08-15T08:00:00+00:00"></time>
+    </div>
+    <div class="tgme_widget_message" data-post="testchan/11">
+      <div class="tgme_widget_message_text">
+        Арендная плата: 120 000 руб/мес, залог 80 000
+      </div>
+      <time datetime="2026-08-15T08:00:20+00:00"></time>
+    </div>
+    """
+
+    class FakeResponse:
+        text = html
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(rb.requests, "get", lambda *a, **kw: FakeResponse())
+
+    posts = rb.fetch_channel_posts("testchan")
+    assert len(posts) == 1
+    assert rb.extract_price(posts[0]["text"]) == 120000
+    assert posts[0]["id"] == 11
+
+
+def test_two_unrelated_posts_without_price_are_not_merged(monkeypatch):
+    # два разных объявления подряд, ни в одном нет цены — не должны
+    # склеиваться просто потому, что оказались рядом по id/времени
+    html = """
+    <div class="tgme_widget_message" data-post="testchan/20">
+      <div class="tgme_widget_message_text">
+        Сдаётся квартира 60 м², м. Преображенская площадь
+      </div>
+      <time datetime="2026-08-15T08:00:00+00:00"></time>
+    </div>
+    <div class="tgme_widget_message" data-post="testchan/21">
+      <div class="tgme_widget_message_text">
+        Ищу квартиру в Москве, 2 комнаты, звоните +7 999 123 45 67
+      </div>
+      <time datetime="2026-08-15T08:00:10+00:00"></time>
+    </div>
+    """
+
+    class FakeResponse:
+        text = html
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(rb.requests, "get", lambda *a, **kw: FakeResponse())
+
+    posts = rb.fetch_channel_posts("testchan")
+    assert len(posts) == 2
+
+
 # ==================== ФИЛЬТРЫ ====================
 
 def test_channel_self_promo_post_is_excluded():

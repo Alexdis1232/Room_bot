@@ -1385,6 +1385,46 @@ def extract_photo_urls(msg_div):
     return urls
 
 
+def _merge_split_posts(posts):
+    # некоторые каналы публикуют одно объявление двумя подряд идущими
+    # сообщениями (упираются в ограничение длины поста Telegram) — вторым
+    # сообщением обычно идёт хвост с ценой/контактами. Без склейки первая
+    # карточка остаётся без цены, хотя в исходном объявлении она была —
+    # просто в другом сообщении. Склеиваем только когда это действительно
+    # похоже на продолжение: соседние id, маленький разрыв по времени, у
+    # второго сообщения нет своих фото (иначе это скорее отдельное
+    # объявление) и именно оно добавляет цену, которой не было в первом
+    if len(posts) < 2:
+        return posts
+
+    by_id = sorted(posts, key=lambda p: p["id"])
+    merged = []
+    skip_next = False
+    for i, post in enumerate(by_id):
+        if skip_next:
+            skip_next = False
+            continue
+        nxt = by_id[i + 1] if i + 1 < len(by_id) else None
+        if (
+            nxt is not None
+            and nxt["id"] == post["id"] + 1
+            and not nxt["photos"]
+            and post.get("datetime") and nxt.get("datetime")
+            and (nxt["datetime"] - post["datetime"]).total_seconds() <= 180
+            and extract_price(post["text"]) is None
+            and extract_price(nxt["text"]) is not None
+        ):
+            combined = dict(post)
+            combined["id"] = nxt["id"]
+            combined["text"] = (post["text"] + "\n" + nxt["text"])[:3000]
+            combined["photos"] = post["photos"] or nxt["photos"]
+            merged.append(combined)
+            skip_next = True
+        else:
+            merged.append(post)
+    return merged
+
+
 def fetch_channel_posts(channel, before=None):
     """Читает посты публичного канала через t.me/s/<channel> — открытую
     веб-версию, не требующую авторизации. before — id сообщения, "старше
@@ -1447,7 +1487,7 @@ def fetch_channel_posts(channel, before=None):
             "photos": extract_photo_urls(msg_div),
         })
 
-    return posts
+    return _merge_split_posts(posts)
 
 
 def fetch_channel_posts_since(channel, cutoff_dt, max_pages=15):
