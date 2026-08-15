@@ -435,3 +435,49 @@ def test_unrelated_posts_not_duplicate():
     words_a = rb.extract_signature_words("Сдам уютную квартиру рядом с метро, звоните")
     words_b = rb.extract_signature_words("Продаю диван, самовывоз, недорого")
     assert rb.is_duplicate(words_b, [list(words_a)]) is False
+
+
+# ==================== ДВОЙНЫЕ ПОСТЫ (ФОТО + ЦЕНА ОТДЕЛЬНО) ====================
+
+def _fake_post(post_id, text, photos=None, channel="chanA"):
+    return {
+        "id": post_id, "channel": channel, "date": "", "datetime": None,
+        "text": text, "link": f"https://t.me/{channel}/{post_id}",
+        "photos": photos or [],
+    }
+
+
+def test_double_post_price_continuation_gets_merged():
+    # реальный паттерн канала Find_flat: фото+описание одним постом, а цена
+    # и контакт — отдельным постом сразу следом, без единого фото и без
+    # собственного признака нового объявления (только цена/контакт/хэштеги)
+    photo_post = _fake_post(
+        40001,
+        "2-к квартира, м.Преображенская площадь, 60,7 м², 5 этаж.",
+        photos=["https://cdn1.telesco.pe/file/a.jpg"],
+    )
+    continuation = _fake_post(
+        40011,
+        "Готова к заселению.\nАрендная плата: 120.000₽ / месяц + ку, залог 80.000₽.\n"
+        "Для связи: @aniaettinger\n#аренда2к\n#квартиры",
+    )
+    merged = rb._merge_price_continuation_posts([photo_post, continuation])
+    assert [p["id"] for p in merged] == [40001]
+    assert rb.extract_price(merged[0]["text"]) == 120000
+    assert rb.extract_contacts(merged[0]["text"]) == "@aniaettinger"
+
+
+def test_independent_next_post_is_not_merged():
+    # следующий пост — самостоятельное объявление (явно указан тип жилья),
+    # а не обрубок с ценой — склеивать не нужно
+    first = _fake_post(1, "Сдаётся комната, метро Сокольники, фото внутри", photos=["x.jpg"])
+    second = _fake_post(2, "Сдаётся 1-к квартира, 60000 руб, звоните")
+    merged = rb._merge_price_continuation_posts([first, second])
+    assert [p["id"] for p in merged] == [1, 2]
+
+
+def test_continuation_from_different_channel_is_not_merged():
+    first = _fake_post(1, "2-к квартира, фото внутри", photos=["x.jpg"], channel="chanA")
+    continuation = _fake_post(2, "Арендная плата: 100.000₽, @someone", channel="chanB")
+    merged = rb._merge_price_continuation_posts([first, continuation])
+    assert [p["id"] for p in merged] == [1, 2]

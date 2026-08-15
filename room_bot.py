@@ -1430,6 +1430,44 @@ def extract_photo_urls(msg_div):
     return urls
 
 
+# хэштеги вроде "#аренда2к" в конце поста-продолжения (см.
+# _looks_like_price_continuation) сами по себе матчатся как "2-к квартира" —
+# это метка поста, а не описание нового объявления, поэтому перед проверкой
+# на "есть ли тут признак самостоятельного объявления" их вырезаем
+_HASHTAG_RE = re.compile(r"#\S+")
+
+
+def _looks_like_price_continuation(post):
+    # некоторые каналы (например Find_flat) публикуют одно объявление ДВУМЯ
+    # отдельными постами подряд: первый — фото и описание квартиры, второй —
+    # без единого фото, только цена/залог и контакт для связи, без явного
+    # признака нового объявления (тип жилья, число комнат). Если его не
+    # склеить с предыдущим, цена и контакты из объявления просто теряются, а
+    # сам обрубок текста не проходит фильтры как самостоятельный пост
+    if post["photos"]:
+        return False
+    text_no_hashtags = _HASHTAG_RE.sub(" ", post["text"])
+    if extract_property_type(text_no_hashtags) != "Не определено":
+        return False
+    if extract_rooms(text_no_hashtags) is not None:
+        return False
+    return extract_price(post["text"]) is not None or extract_contacts(post["text"]) is not None
+
+
+def _merge_price_continuation_posts(posts):
+    merged = []
+    for post in posts:
+        if (
+            merged
+            and post["channel"] == merged[-1]["channel"]
+            and _looks_like_price_continuation(post)
+        ):
+            merged[-1]["text"] = (merged[-1]["text"] + "\n" + post["text"])[:3000]
+            continue
+        merged.append(post)
+    return merged
+
+
 def fetch_channel_posts(channel, before=None):
     """Читает посты публичного канала через t.me/s/<channel> — открытую
     веб-версию, не требующую авторизации. before — id сообщения, "старше
@@ -1492,7 +1530,7 @@ def fetch_channel_posts(channel, before=None):
             "photos": extract_photo_urls(msg_div),
         })
 
-    return posts
+    return _merge_price_continuation_posts(posts)
 
 
 def fetch_channel_posts_since(channel, cutoff_dt, max_pages=15):
