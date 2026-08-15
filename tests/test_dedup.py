@@ -165,6 +165,48 @@ def test_manual_send_digest_call_prevents_later_resend(monkeypatch, tmp_path):
     assert results == []
 
 
+def test_mark_as_sent_survives_concurrent_processes(monkeypatch, tmp_path):
+    # RoomBot (плановый скан) и RoomBotListener (кнопка "Применить") — два
+    # независимых процесса, оба в итоге зовут _mark_as_sent. Раньше она
+    # читала sent_post_ids ДО блокировки (load_json), а потом отдельным
+    # вызовом save_state сохраняла посчитанный список — если оба процесса
+    # успевали прочитать состояние друг у друга "из-под носа" в этом
+    # промежутке, тот, что писал вторым, стирал только что добавленные id
+    # первого, и его пост "забывался" отправленным и уходил повторно
+    import threading
+    import time
+
+    state_path = tmp_path / "state.json"
+    monkeypatch.setattr(rb, "STATE_PATH", str(state_path))
+    monkeypatch.setattr(rb, "STATE_LOCK_PATH", str(state_path) + ".lock")
+    monkeypatch.setattr(rb, "state", {"last_ids": {}})
+
+    real_load_json = rb.load_json
+
+    def slow_load_json(path, default):
+        result = real_load_json(path, default)
+        if path == str(state_path):
+            time.sleep(0.05)
+        return result
+
+    monkeypatch.setattr(rb, "load_json", slow_load_json)
+
+    posts_a = [make_post(i, channel="chanA") for i in range(1, 6)]
+    posts_b = [make_post(i, channel="chanB") for i in range(1, 6)]
+
+    t1 = threading.Thread(target=rb._mark_as_sent, args=(posts_a,))
+    t2 = threading.Thread(target=rb._mark_as_sent, args=(posts_b,))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    on_disk = real_load_json(str(state_path), {})
+    ids = set(on_disk.get("sent_post_ids", []))
+    expected = {f"chanA/{i}" for i in range(1, 6)} | {f"chanB/{i}" for i in range(1, 6)}
+    assert ids == expected
+
+
 def test_save_state_merges_instead_of_clobbering_other_process(monkeypatch, tmp_path):
     # имитация гонки двух процессов: "скан" пишет last_ids/sent_post_ids,
     # "слушатель" с более старым state в памяти сохраняет свои изменения

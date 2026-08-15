@@ -95,6 +95,26 @@ def _unlock_file(f):
         fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
+def _update_state_locked(update_fn):
+    # то же, что save_state ниже, но для случаев, когда новое значение поля
+    # зависит от его же ТЕКУЩЕГО содержимого на диске (например, дописать
+    # новые id в sent_post_ids), а не просто заменяет поле целиком.
+    # update_fn получает свежепрочитанный с диска словарь и мутирует его на
+    # месте — чтение, изменение и запись происходят под ОДНОЙ и той же
+    # блокировкой, без промежутка, в котором другой процесс мог бы вклиниться
+    global state
+    with open(STATE_LOCK_PATH, "a+b") as lock_file:
+        _lock_file(lock_file)
+        try:
+            fresh = load_json(STATE_PATH, {"last_ids": {}})
+            update_fn(fresh)
+            save_json(STATE_PATH, fresh)
+            state = fresh
+        finally:
+            _unlock_file(lock_file)
+    return state
+
+
 def save_state(**changed):
     # RoomBot (плановый скан каналов) и RoomBotListener (непрерывный
     # слушатель команд/кнопок) — два независимых процесса, каждый со своей
@@ -106,17 +126,7 @@ def save_state(**changed):
     # поверх только те поля, которые реально изменил именно этот вызов; сама
     # запись — под файловой блокировкой, чтобы два процесса не считали и не
     # переписали файл одновременно
-    global state
-    with open(STATE_LOCK_PATH, "a+b") as lock_file:
-        _lock_file(lock_file)
-        try:
-            fresh = load_json(STATE_PATH, {"last_ids": {}})
-            fresh.update(changed)
-            save_json(STATE_PATH, fresh)
-            state = fresh
-        finally:
-            _unlock_file(lock_file)
-    return state
+    return _update_state_locked(lambda fresh: fresh.update(changed))
 
 
 DEFAULT_CONFIG = {
@@ -1353,6 +1363,14 @@ def matches_filters(text, filters, has_photos=False):
             return False
 
     price = extract_price(text)
+    # ни цены, ни контактов вообще — это не объявление о сдаче, а какой-то
+    # другой пост канала (рекламный/просветительский), который просто
+    # зацепил ключевое слово фильтра (например слово "комнаты" в посте про
+    # историю хрущёвок). Настоящее объявление всегда даёт способ откликнуться
+    # — цену или контакт, иначе оно бессмысленно как объявление
+    if price is None and not extract_contacts(text):
+        return False
+
     price_ranges = filters.get("price_ranges")
     if price_ranges:
         # кнопочное меню задаёт несколько отдельных диапазонов сразу —
@@ -1779,11 +1797,23 @@ def _mark_as_sent(posts):
     # "Применить" и уйти пользователю второй раз
     if not posts:
         return
-    sent_ids_list = load_json(STATE_PATH, {}).get("sent_post_ids", [])
-    sent_ids_set = set(sent_ids_list)
-    new_keys = [k for p in posts if (k := _post_key(p)) not in sent_ids_set]
-    if new_keys:
-        save_state(sent_post_ids=(sent_ids_list + new_keys)[-SENT_POST_IDS_LIMIT:])
+    keys = [_post_key(p) for p in posts]
+
+    # чтение текущего sent_post_ids, вычисление новых ключей и запись — всё
+    # под одной блокировкой (_update_state_locked), а не раздельными load_json
+    # + save_state с промежутком между ними. Раньше между этим чтением и
+    # записью мог успеть отработать другой процесс (плановый скан RoomBot и
+    # слушатель кнопки "Применить" — два независимых процесса) — тогда его
+    # только что добавленные id стирались следующей записью отсюда, пост
+    # "забывался" отправленным и уходил повторно
+    def _apply(fresh):
+        sent_ids_list = fresh.get("sent_post_ids", [])
+        sent_ids_set = set(sent_ids_list)
+        new_keys = [k for k in keys if k not in sent_ids_set]
+        if new_keys:
+            fresh["sent_post_ids"] = (sent_ids_list + new_keys)[-SENT_POST_IDS_LIMIT:]
+
+    _update_state_locked(_apply)
 
 
 def send_digest(posts):

@@ -357,7 +357,7 @@ def test_landlord_seeking_tenant_is_not_excluded():
         "districts": [], "price_ranges": [], "property_types": [],
         "price_min": 0, "price_max": 200000, "rooms": [], "metro_max_minutes": None,
     }
-    landlord_text = "Сдается студия. Ищем аккуратного жильца или пару на длительный срок."
+    landlord_text = "Сдается студия, 60000 руб. Ищем аккуратного жильца или пару на длительный срок."
     assert rb.matches_filters(landlord_text, filters) is True
 
     tenant_text = "Ищу квартиру в аренду, срочно, звоните."
