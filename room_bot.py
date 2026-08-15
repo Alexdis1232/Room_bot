@@ -216,6 +216,9 @@ ROOM_WORD_RE = re.compile(
     r"(?<!ванн(?:ая|ую|ой)\s)(?<!детск(?:ая|ую|ой)\s)\bкомнат[ауы]\b",
     re.IGNORECASE,
 )
+# "спальное место" — тоже сдача комнаты (часто в формате койко-места/подселения),
+# просто без слова "комната" в тексте
+BED_SPACE_RE = re.compile(r"спальн\w*\s*мест\w*", re.IGNORECASE)
 # "м" как сокращение метро часто пишут без точки (структурированные объявления
 # вида "м Марксистская"); \bм\.?(?=\s) требует отдельное слово из одной буквы,
 # чтобы не сработать на "дом", "самолёт" и т.п.
@@ -1038,7 +1041,7 @@ ADDRESS_RE = re.compile(
 )
 
 
-def extract_property_type(text):
+def extract_property_type(text, has_photos=False):
     lower = text.lower()
 
     if "евродвушк" in lower:
@@ -1048,13 +1051,22 @@ def extract_property_type(text):
     if "евростуди" in lower:
         return "Евростудия"
     if "ищу сосед" in lower:
+        # "ищу соседку/соседа" + приложенные фото квартиры значит, что автор
+        # уже живёт там и ищет, кто займёт свободную комнату — по сути то же
+        # самое объявление о сдаче комнаты, просто сформулированное как поиск
+        # соседа, а не "сдаю". Без фото это не отличить от общего поста
+        # "ищу соседа, детали в лс" без конкретного предложения — оставляем
+        # как есть, чтобы не подсовывать в фильтр "Комната" пустые объявления
+        if has_photos:
+            return "Комната"
         return "Ищу соседку/соседа"
 
-    # "комната"/"комнату"/"комнаты" отдельным словом значит, что сдаётся
-    # именно комната — даже если дальше по тексту упоминается описание всей
-    # квартиры вроде "2-комнатная квартира" (у него другое окончание,
-    # ROOM_WORD_RE его не ловит, поэтому проверяем это раньше подсчёта комнат)
-    if ROOM_WORD_RE.search(text):
+    # "комната"/"комнату"/"комнаты" отдельным словом или "спальное место"
+    # значит, что сдаётся именно комната — даже если дальше по тексту
+    # упоминается описание всей квартиры вроде "2-комнатная квартира" (у
+    # него другое окончание, ROOM_WORD_RE его не ловит, поэтому проверяем
+    # это раньше подсчёта комнат)
+    if ROOM_WORD_RE.search(text) or BED_SPACE_RE.search(text):
         return "Комната"
 
     rooms = extract_rooms(text)
@@ -1325,7 +1337,7 @@ def is_duplicate(words, seen_word_lists, threshold=0.6):
     return False
 
 
-def matches_filters(text, filters):
+def matches_filters(text, filters, has_photos=False):
     lower = text.lower()
 
     if filters["keywords_include"]:
@@ -1353,7 +1365,7 @@ def matches_filters(text, filters):
 
     property_types = filters.get("property_types")
     if property_types:
-        normalized = normalize_property_type(extract_property_type(text))
+        normalized = normalize_property_type(extract_property_type(text, has_photos=has_photos))
         if normalized not in property_types:
             return False
 
@@ -1563,7 +1575,7 @@ def send_recent_matching_ads(hours=48, channels=None, filters=None):
             continue
 
         for post in posts:
-            if not matches_filters(post["text"], filters):
+            if not matches_filters(post["text"], filters, has_photos=bool(post.get("photos"))):
                 continue
             if _post_key(post) in sent_ids_set:
                 # уже отправляли этот пост раньше (при любом фильтре) —
@@ -1614,7 +1626,7 @@ def fetch_new_posts(channels, filters):
                 continue
             max_id_seen = max(max_id_seen, post["id"])
 
-            if not matches_filters(post["text"], filters):
+            if not matches_filters(post["text"], filters, has_photos=bool(post.get("photos"))):
                 continue
 
             if _post_key(post) in sent_ids_set:
@@ -1663,7 +1675,7 @@ SCAM_WARNING_HTML = (
 
 
 def format_post_message(p):
-    property_type = extract_property_type(p["text"])
+    property_type = extract_property_type(p["text"], has_photos=bool(p.get("photos")))
     area = extract_area(p["text"])
     metro = extract_metro_info(p["text"])
     metro_station = extract_metro_station(p["text"])
