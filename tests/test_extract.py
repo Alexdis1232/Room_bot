@@ -208,6 +208,14 @@ def test_property_type_room_word_wins_over_room_count():
     assert rb.extract_property_type("Сдаётся комната в квартире") == "Комната"
 
 
+def test_property_type_bed_space_counts_as_room():
+    # "койко-место"/"койко место"/"спальное место" — тоже фактически сдача
+    # комнаты (подселение), просто без слова "комната" в тексте
+    assert rb.extract_property_type("Сдаётся койко-место в 3-комнатной квартире") == "Комната"
+    assert rb.extract_property_type("Сдаётся койко место в квартире") == "Комната"
+    assert rb.extract_property_type("Сдаётся спальное место, метро ВДНХ") == "Комната"
+
+
 def test_property_type_not_confused_by_bathroom_mention():
     # "Ванная комната" в списке удобств не должна перекрывать реальный тип
     # жилья ("Студия" из заголовка) — раньше любое упоминание "Ванная
