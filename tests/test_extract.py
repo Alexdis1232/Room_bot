@@ -354,6 +354,31 @@ def test_split_post_with_price_in_second_message_gets_merged(monkeypatch):
     assert posts[0]["id"] == 11
 
 
+def test_photo_from_disallowed_host_is_skipped_and_logged(monkeypatch):
+    # если Telegram отдаёт превью фото с хоста, не входящего в allow-list
+    # (не *.telesco.pe), фото тихо отбрасывалось раньше без единого следа в
+    # логе — теперь должна остаться запись, по которой можно разобраться,
+    # почему у поста с явным альбомом фото не оказалось
+    from bs4 import BeautifulSoup
+
+    html = """
+    <div class="tgme_widget_message" data-post="flats_for_friend/125069">
+      <div class="tgme_widget_message_photo_wrap"
+           style="background-image:url('https://evil-cdn.example.com/file/1.jpg')"></div>
+    </div>
+    """
+    msg_div = BeautifulSoup(html, "html.parser").select_one(".tgme_widget_message")
+
+    logged = []
+    monkeypatch.setattr(rb, "log", lambda msg: logged.append(msg))
+
+    urls = rb.extract_photo_urls(msg_div)
+
+    assert urls == []
+    assert len(logged) == 1
+    assert "flats_for_friend/125069" in logged[0]
+
+
 def test_two_unrelated_posts_without_price_are_not_merged(monkeypatch):
     # два разных объявления подряд, ни в одном нет цены — не должны
     # склеиваться просто потому, что оказались рядом по id/времени

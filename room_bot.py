@@ -1378,10 +1378,25 @@ def extract_photo_urls(msg_div):
     # альбом (несколько фото у одного поста) — все они лежат внутри того же
     # блока сообщения, каждое своим .tgme_widget_message_photo_wrap
     urls = []
+    skipped_hosts = []
     for wrap in msg_div.select(".tgme_widget_message_photo_wrap"):
         m = PHOTO_URL_RE.search(wrap.get("style", ""))
-        if m and ALLOWED_PHOTO_HOST_RE.match(m.group(2)) and m.group(2) not in urls:
-            urls.append(m.group(2))
+        if not m:
+            continue
+        url = m.group(2)
+        if ALLOWED_PHOTO_HOST_RE.match(url):
+            if url not in urls:
+                urls.append(url)
+        else:
+            skipped_hosts.append(url)
+
+    if skipped_hosts and not urls:
+        # раньше несовпадение хоста с allow-list молча приводило к посту без
+        # единого фото — не было даже записи в лог, чтобы потом разобраться,
+        # почему у конкретного объявления с явным альбомом фото пропали
+        data_post = msg_div.get("data-post", "?")
+        log(f"Пост {data_post}: {len(skipped_hosts)} фото найдено, но хост не в allow-list: {skipped_hosts[0]}")
+
     return urls
 
 
