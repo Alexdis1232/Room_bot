@@ -532,6 +532,9 @@ INFRA_KEYWORDS = [
     (r"поликлиник\w*", "поликлиника"),
     (r"супермаркет\w*", "супермаркет"),
     (r"\bтрц\b|торгов\w*\s*центр\w*|\bтц\b", "торговый центр"),
+    (r"пункт\w*\s*выдач\w*", "пункт выдачи"),
+    (r"кофейн\w*", "кофейня"),
+    (r"булочн\w*|пекарн\w*", "булочная-пекарня"),
 ]
 # конкретные названия магазинов/сетей — их показываем ТЕКСТОМ ИЗ ИСТОЧНИКА
 # (как в оригинале), а не заменяем обобщённой фразой вроде "магазины рядом"
@@ -539,7 +542,8 @@ SHOP_NAME_RE = re.compile(
     r"пятёрочк\w*|пятерочк\w*|магнит(?!огорск)\w*|перекр[её]ст\w*|дикси\w*"
     r"|ашан\w*|вкусвилл\w*|лент\w*а\b|wildberries|вайлдбери[сз]\w*|озон\b|ozon"
     r"|красное\s*[&и]\s*белое|билла\w*|spar\b|спар\b|fix\s*price|фикс\s*прайс"
-    r"|верный\b|азбука\s*вкуса|сбермаркет\w*|садовод\w*|метро\s*кэш",
+    r"|верный\b|азбука\s*вкуса|сбермаркет\w*|садовод\w*|метро\s*кэш"
+    r"|яндекс\s*маркет|yandex\s*market",
     re.IGNORECASE,
 )
 # слово "магазин" вообще, без конкретного названия — запасной вариант,
@@ -623,15 +627,26 @@ def extract_infrastructure(text):
 
     # магазины/сети — реальным названием из текста, а не обобщённой фразой
     shop_names = []
+    shop_name_spans = []
     for m in SHOP_NAME_RE.finditer(text):
         name = m.group(0).strip()
         key = name.lower()
+        shop_name_spans.append(m.span())
         if key not in seen:
             seen.add(key)
             shop_names.append(name)
-    if shop_names:
-        found.extend(shop_names)
-    elif GENERIC_SHOP_RE.search(text) and "магазины рядом" not in seen:
+    found.extend(shop_names)
+
+    # отдельное упоминание магазинов "вообще" (например, "продуктовые
+    # магазины" рядом с уже найденным именем сети типа "Ozon") — добавляем
+    # его тоже, а не только когда никакая сеть по имени не нашлась вообще:
+    # названная сеть и общее "магазины рядом" — про разные вещи и оба могут
+    # быть в одном объявлении
+    has_standalone_generic_mention = any(
+        not _span_overlaps_any(m.span(), shop_name_spans)
+        for m in GENERIC_SHOP_RE.finditer(text)
+    )
+    if has_standalone_generic_mention and "магазины рядом" not in seen:
         found.append("магазины рядом")
         seen.add("магазины рядом")
 
