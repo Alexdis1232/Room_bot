@@ -1775,6 +1775,11 @@ def send_digest(posts):
                 send_telegram_message(message, parse_mode="HTML")
                 continue
 
+        if photo_url:
+            # у поста были фото, но отправить не получилось ни одно —
+            # раньше это проходило совсем незаметно: пост тихо уходил
+            # текстом, и по логу нельзя было понять, что фото вообще были
+            log(f"Пост {p.get('link')} отправлен без фото — все попытки скачать/отправить не удались")
         send_telegram_message(message, parse_mode="HTML")
 
     _mark_as_sent(posts)
@@ -1824,22 +1829,46 @@ def edit_message_reply_markup(chat_id, message_id, reply_markup):
     _telegram_api("editMessageReplyMarkup", data=data)
 
 
+# сколько раз повторить скачивание фото при временном сбое (таймаут,
+# обрыв соединения) прежде чем сдаться — раньше единственная неудачная
+# попытка тихо превращала пост с альбомом в пост без единой фотографии
+PHOTO_DOWNLOAD_RETRIES = 3
+PHOTO_DOWNLOAD_RETRY_DELAY = 1.5
+
+
+def _download_image(photo_url, label):
+    last_error = None
+    for attempt in range(1, PHOTO_DOWNLOAD_RETRIES + 1):
+        try:
+            # Telegram сам не может скачать эту картинку с CDN канала (отдаёт
+            # "failed to get HTTP URL content"), поэтому качаем её сами и
+            # заливаем файлом, а не просто передаём ссылку
+            img = requests.get(photo_url, headers=HEADERS, timeout=15)
+            img.raise_for_status()
+            return img.content
+        except requests.HTTPError as e:
+            # 4xx/5xx от самого CDN (например, ссылка на файл устарела) —
+            # повторная попытка того же URL ничего не изменит
+            log(f"Не удалось скачать {label}: {e}")
+            return None
+        except requests.RequestException as e:
+            last_error = e
+            if attempt < PHOTO_DOWNLOAD_RETRIES:
+                time.sleep(PHOTO_DOWNLOAD_RETRY_DELAY * attempt)
+    log(f"Не удалось скачать {label} после {PHOTO_DOWNLOAD_RETRIES} попыток: {last_error}")
+    return None
+
+
 def send_telegram_photo(photo_url, caption=None, parse_mode=None):
     data = {"chat_id": MY_CHAT_ID}
     if caption:
         data["caption"] = caption
     if parse_mode:
         data["parse_mode"] = parse_mode
-    try:
-        # Telegram сам не может скачать эту картинку с CDN канала (отдаёт
-        # "failed to get HTTP URL content"), поэтому качаем её сами и
-        # заливаем файлом, а не просто передаём ссылку
-        img = requests.get(photo_url, headers=HEADERS, timeout=15)
-        img.raise_for_status()
-    except requests.RequestException as e:
-        log(f"Не удалось скачать фото для отправки: {e}")
+    content = _download_image(photo_url, "фото для отправки")
+    if content is None:
         return False
-    files = {"photo": ("photo.jpg", img.content)}
+    files = {"photo": ("photo.jpg", content)}
     return _telegram_api("sendPhoto", data=data, files=files, timeout=20) is not None
 
 
@@ -1850,14 +1879,11 @@ def send_telegram_media_group(photo_urls, caption=None, parse_mode=None):
     files = {}
     media = []
     for i, photo_url in enumerate(photo_urls):
-        try:
-            img = requests.get(photo_url, headers=HEADERS, timeout=15)
-            img.raise_for_status()
-        except requests.RequestException as e:
-            log(f"Не удалось скачать фото {i} для альбома: {e}")
+        content = _download_image(photo_url, f"фото {i} для альбома")
+        if content is None:
             continue
         field = f"photo{i}"
-        files[field] = (f"{field}.jpg", img.content)
+        files[field] = (f"{field}.jpg", content)
         item = {"type": "photo", "media": f"attach://{field}"}
         if i == 0 and caption:
             item["caption"] = caption
