@@ -33,6 +33,15 @@ def test_price_excludes_nearby_utility_amount():
     assert rb.extract_price("70 000 руб + 3 600 коммунальные услуги") == 70000
 
 
+def test_price_with_rub_per_month_abbreviation_no_dot():
+    # "40.000 р/мес" — сокращение "рублей/месяц" без точки после "р": ни
+    # PRICE_RE (там после "р" всегда нужна точка, а не "/"), ни старый
+    # PRICE_MONTH_RE (не пускал букву "р" перед "/мес") это не ловили,
+    # цена уходила как "не указана" у реального объявления с ценой
+    assert rb.extract_price("Условия: 40.000 р/мес. К/у включены в стоимость") == 40000
+    assert rb.extract_price("40000 р/мес") == 40000
+
+
 def test_price_shorthand_with_plus_sign():
     # "Оплата 45+ счётчики" = 45 тысяч + коммуналка отдельно
     assert rb.extract_price("Оплата 45+ счётчики") == 45000
