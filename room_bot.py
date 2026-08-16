@@ -198,6 +198,11 @@ PRICE_SHORTHAND_RE = re.compile(
     r"(?:" + _PRICE_KEYWORD + r")\D{0,5}(\d{2,3})\s*(?:\+|тыс\w*|к\b)",
     re.IGNORECASE,
 )
+# та же сокращённая запись тысяч, но БЕЗ слова-подсказки рядом — "28к" часто
+# пишут отдельной строкой сам по себе. 2-3 цифры (не 1) — чтобы не задеть
+# сокращение числа комнат ("2к квартира"/"3к"), там всегда одна цифра и его
+# уже отдельно ловит ROOMS_RE
+PRICE_BARE_SHORTHAND_RE = re.compile(r"(?<!\d)(\d{2,3})\s?к\b(?!\w)", re.IGNORECASE)
 DEPOSIT_RE = re.compile(r"залог\w*|депозит\w*", re.IGNORECASE)
 COMMISSION_RE = re.compile(r"комисси\w*", re.IGNORECASE)
 # отдельные мелкие ежемесячные платежи (интернет и т.п.) со своим "руб/₽"
@@ -401,6 +406,13 @@ def extract_price(text):
             return val
 
     for m in PRICE_SHORTHAND_RE.finditer(text):
+        if _span_overlaps_any(m.span(1), exclude_spans):
+            continue
+        val = _price_to_int(m.group(1))
+        if val is not None:
+            return val * 1000
+
+    for m in PRICE_BARE_SHORTHAND_RE.finditer(text):
         if _span_overlaps_any(m.span(1), exclude_spans):
             continue
         val = _price_to_int(m.group(1))

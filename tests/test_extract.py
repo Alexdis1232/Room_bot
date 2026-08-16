@@ -47,6 +47,15 @@ def test_price_shorthand_with_plus_sign():
     assert rb.extract_price("Оплата 45+ счётчики") == 45000
 
 
+def test_price_bare_shorthand_without_keyword():
+    # "28к" отдельной строкой, без "цена/оплата/стоимость" рядом — частый
+    # компактный формат ("28к (все включено)")
+    assert rb.extract_price("Расположение: метро Белорусская\n28к (все включено)") == 28000
+    # но не однозначное сокращение числа комнат (там всегда одна цифра)
+    assert rb.extract_price("2-к квартира, метро Сокольники") is None
+    assert rb.extract_price("35 кв.м, ремонт свежий") is None
+
+
 def test_price_shorthand_prepositional_case():
     # "По цене: 28к" — раньше не ловилось: искали только "цена" в
     # именительном падеже, а тут предложный ("цене")
