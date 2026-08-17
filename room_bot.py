@@ -2484,14 +2484,74 @@ def process_commands():
     _process_update_batch(get_telegram_updates())
 
 
+# ==================== САМООБНОВЛЕНИЕ ====================
+# Раньше любой фикс требовал вручную скачать новый room_bot.py, подменить
+# файл на компьютере и перезапустить задачи в Планировщике — легко забыть
+# или пропустить, и бот неделями работал на старой версии, пока правки
+# копились в репозитории без всякого толку. Теперь бот сам сверяется с
+# GitHub при каждом запуске (и периодически в --listen) и обновляет себя.
+SELF_UPDATE_URL = "https://raw.githubusercontent.com/Alexdis1232/Room_bot/main/room_bot.py"
+# как часто проверять обновления внутри непрерывного слушателя (--listen) —
+# та же частота, что и у планового скана каналов
+SELF_UPDATE_CHECK_INTERVAL = 15 * 60
+
+
+def _maybe_self_update(restart_on_update=False, target_path=None):
+    try:
+        resp = requests.get(SELF_UPDATE_URL, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        log(f"Не удалось проверить обновления: {e}")
+        return False
+
+    new_code = resp.text
+    # простая защита от сохранения мусора вместо кода — например, если
+    # вместо сырого файла GitHub вдруг отдал HTML-страницу с ошибкой
+    if "def main(" not in new_code or len(new_code) < 1000:
+        log("Проверка обновлений: с GitHub пришло что-то не похожее на код, пропускаю")
+        return False
+
+    current_path = target_path or os.path.abspath(__file__)
+    try:
+        with open(current_path, "r", encoding="utf-8") as f:
+            current_code = f.read()
+    except OSError as e:
+        log(f"Не удалось прочитать свой файл для сравнения версий: {e}")
+        return False
+
+    if new_code == current_code:
+        return False
+
+    try:
+        with open(current_path, "w", encoding="utf-8") as f:
+            f.write(new_code)
+    except OSError as e:
+        log(f"Не удалось сохранить обновление: {e}")
+        return False
+
+    log("Скачана новая версия room_bot.py с GitHub")
+    if restart_on_update:
+        # для --listen: просто завершаем процесс — Планировщик заданий сам
+        # перезапустит задачу RoomBotListener в течение минуты (см.
+        # RestartCount/RestartInterval в setup_room_bot.ps1), уже читая
+        # обновлённый файл с диска
+        log("Перезапускаюсь, чтобы подхватить новый код")
+        sys.exit(0)
+    return True
+
+
 def listen_loop():
     # непрерывный long-polling: держит соединение с Telegram открытым до
     # 25 секунд в ожидании нового апдейта — как только он приходит, кнопка/
     # команда обрабатывается сразу же, без задержки в 15 минут/1 минуту,
     # свойственной запуску через Планировщик
     log("Слушатель команд запущен")
+    last_update_check = time.monotonic()
     while True:
         try:
+            if time.monotonic() - last_update_check > SELF_UPDATE_CHECK_INTERVAL:
+                _maybe_self_update(restart_on_update=True)
+                last_update_check = time.monotonic()
             started = time.monotonic()
             updates = get_telegram_updates(poll_timeout=25)
             if updates:
@@ -2509,6 +2569,7 @@ def listen_loop():
 # ==================== ОСНОВНОЙ ЗАПУСК ====================
 
 def main():
+    _maybe_self_update()
     # команды/кнопки теперь обрабатывает непрерывный слушатель (--listen,
     # задача RoomBotListener) через long polling — если здесь тоже дёргать
     # getUpdates, Telegram отдаёт 409 Conflict (нельзя два одновременных
