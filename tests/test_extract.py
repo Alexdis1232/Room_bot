@@ -56,6 +56,15 @@ def test_price_bare_shorthand_without_keyword():
     assert rb.extract_price("35 кв.м, ремонт свежий") is None
 
 
+def test_price_after_usloviya_keyword():
+    # "Условия:" — частый заголовок блока с ценой вместо "Цена"/"Оплата"
+    # ("💳 Условия: 55.000₽ в месяц"), в том числе без валютного знака рядом
+    assert rb.extract_price("Условия: 55000, без животных") == 55000
+    assert rb.extract_price("💳 Условия: 55.000₽ в месяц + 50.000₽ залог") == 55000
+    # но не любое слово с этим корнем без числа рядом
+    assert rb.extract_price("Условия проживания: тихо, спокойно") is None
+
+
 def test_price_shorthand_prepositional_case():
     # "По цене: 28к" — раньше не ловилось: искали только "цена" в
     # именительном падеже, а тут предложный ("цене")
