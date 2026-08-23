@@ -2031,6 +2031,26 @@ def send_telegram_photo(photo_url, caption=None, parse_mode=None, reply_markup=N
     return _telegram_api("sendPhoto", data=data, files=files, timeout=20) is not None
 
 
+def send_telegram_photo_file(path, caption=None, parse_mode=None, reply_markup=None):
+    # для локальных картинок бота (например обложка приветствия) — файл
+    # уже лежит на диске рядом со скриптом, скачивать по URL не нужно
+    data = {"chat_id": MY_CHAT_ID}
+    if caption:
+        data["caption"] = caption
+    if parse_mode:
+        data["parse_mode"] = parse_mode
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
+    try:
+        with open(path, "rb") as f:
+            content = f.read()
+    except OSError as e:
+        log(f"Не удалось прочитать локальную картинку {path}: {e}")
+        return False
+    files = {"photo": (os.path.basename(path), content)}
+    return _telegram_api("sendPhoto", data=data, files=files, timeout=20) is not None
+
+
 def send_telegram_media_group(photo_urls, caption=None, parse_mode=None):
     # Telegram принимает максимум 10 фото в одной группе
     photo_urls = photo_urls[:10]
@@ -2224,9 +2244,13 @@ def handle_callback_query(cq):
 WELCOME_TEXT = (
     "🤖 Я бот-помощник — собираю объявления об аренде жилья (без комиссии) "
     "в Москве и МО из десятков Telegram-каналов в одном месте.\n\n"
-    "Фильтры настраиваются прямо здесь, в чате — остаётся только ждать "
-    "объявлений."
+    "Фильтры настраиваются прямо здесь, в чате: тип жилья, диапазон цен, "
+    "районы — дальше остаётся только ждать объявлений."
 )
+
+# картинка-обложка к приветствию (логотип как есть, без обработки) —
+# лежит рядом с самим скриптом, в assets/
+WELCOME_IMAGE_PATH = os.path.join(os.path.dirname(__file__), "assets", "welcome.jpg")
 
 HELP_TEXT = (
     "Доступные команды:\n\n"
@@ -2280,7 +2304,13 @@ def handle_command(text):
     arg = parts[1].strip() if len(parts) > 1 else ""
 
     if cmd == "/start":
-        send_telegram_message(WELCOME_TEXT, reply_markup=MAIN_REPLY_KEYBOARD)
+        sent = False
+        if os.path.exists(WELCOME_IMAGE_PATH):
+            sent = send_telegram_photo_file(
+                WELCOME_IMAGE_PATH, caption=WELCOME_TEXT, reply_markup=MAIN_REPLY_KEYBOARD
+            )
+        if not sent:
+            send_telegram_message(WELCOME_TEXT, reply_markup=MAIN_REPLY_KEYBOARD)
         return
 
     if cmd == "/help":
@@ -2559,6 +2589,47 @@ def _maybe_self_update(restart_on_update=False, target_path=None):
     return True
 
 
+# статические файлы (например картинка приветствия) — самообновление
+# room_bot.py само по себе их не трогает, файл на диске и файл в
+# репозитории обновляются раздельно; синхронизируем их так же
+ASSET_FILES = ["assets/welcome.jpg"]
+ASSET_BASE_URL = "https://raw.githubusercontent.com/Alexdis1232/Room_bot/main"
+
+
+def _maybe_sync_assets(base_dir=None):
+    base_dir = base_dir or os.path.dirname(os.path.abspath(__file__))
+    for rel_path in ASSET_FILES:
+        url = f"{ASSET_BASE_URL}/{rel_path}"
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            log(f"Не удалось проверить обновление файла {rel_path}: {e}")
+            continue
+
+        new_content = resp.content
+        if not new_content:
+            continue
+
+        local_path = os.path.join(base_dir, rel_path)
+        try:
+            with open(local_path, "rb") as f:
+                current_content = f.read()
+        except OSError:
+            current_content = None
+
+        if new_content == current_content:
+            continue
+
+        try:
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            with open(local_path, "wb") as f:
+                f.write(new_content)
+            log(f"Обновлён файл {rel_path}")
+        except OSError as e:
+            log(f"Не удалось сохранить файл {rel_path}: {e}")
+
+
 def listen_loop():
     # непрерывный long-polling: держит соединение с Telegram открытым до
     # 25 секунд в ожидании нового апдейта — как только он приходит, кнопка/
@@ -2570,6 +2641,7 @@ def listen_loop():
         try:
             if time.monotonic() - last_update_check > SELF_UPDATE_CHECK_INTERVAL:
                 _maybe_self_update(restart_on_update=True)
+                _maybe_sync_assets()
                 last_update_check = time.monotonic()
             started = time.monotonic()
             updates = get_telegram_updates(poll_timeout=25)
@@ -2589,6 +2661,7 @@ def listen_loop():
 
 def main():
     _maybe_self_update()
+    _maybe_sync_assets()
     # команды/кнопки теперь обрабатывает непрерывный слушатель (--listen,
     # задача RoomBotListener) через long polling — если здесь тоже дёргать
     # getUpdates, Telegram отдаёт 409 Conflict (нельзя два одновременных
