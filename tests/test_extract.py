@@ -65,6 +65,13 @@ def test_price_after_usloviya_keyword():
     assert rb.extract_price("Условия проживания: тихо, спокойно") is None
 
 
+def test_price_after_stoimost_keyword():
+    # "Стоимость" — тоже частый заголовок с ценой, в том числе без
+    # валютного знака и в коротком формате с "к"
+    assert rb.extract_price("Стоимость: 45000, без животных") == 45000
+    assert rb.extract_price("Стоимость 45к, все включено") == 45000
+
+
 def test_price_shorthand_prepositional_case():
     # "По цене: 28к" — раньше не ловилось: искали только "цена" в
     # именительном падеже, а тут предложный ("цене")
@@ -147,39 +154,43 @@ def test_area_shorthand_does_not_break_metro_abbreviation():
 
 # ==================== МЕБЕЛЬ ====================
 
-def test_basic_furniture_detected_from_individual_pieces():
-    # по фото бот не смотрит — ориентируется на упоминания конкретных
-    # предметов обстановки в тексте (кровать/шкаф/...), даже без слова
-    # "мебель" целиком
+def test_furniture_shown_by_default():
+    # мебель считается присутствующей по умолчанию (комнаты/квартиры в
+    # таких объявлениях почти всегда меблированы, это видно на фото, даже
+    # когда текст об этом молчит) — первым пунктом, даже без единого
+    # упоминания мебели в самом тексте
+    text = "Уютная студия в центре Москвы, кондиционер, wi-fi."
+    amenities = rb.extract_amenities(text)
+    assert amenities[0] == "мебель"
+    assert "кондиционер" in amenities
+
+
+def test_furniture_default_even_with_individual_pieces_mentioned():
+    # упоминание отдельных предметов (кровать/стол/стул) — тоже просто
+    # "мебель" одним словом, а не перечисление каждого предмета отдельно
     text = (
         "В студии есть: кровать 140x200 с матрасом; большой шкаф; "
         "кондиционер; обеденный стол и 2 стула."
     )
     amenities = rb.extract_amenities(text)
-    assert amenities[0] == "базовая мебель"
+    assert amenities[0] == "мебель"
     assert "кондиционер" in amenities
 
 
-def test_basic_furniture_not_confused_with_oven():
-    # "духовой шкаф" — кухонная техника, а не платяной шкаф; само по себе
-    # не должно считаться признаком базовой мебели
-    text = "Оснащение кухни: варочная панель, духовой шкаф, холодильник."
-    amenities = rb.extract_amenities(text)
-    assert "базовая мебель" not in amenities
-    assert "духовой шкаф" in amenities
-
-
-def test_basic_furniture_respects_negation():
+def test_furniture_negation_shown_explicitly():
+    # только явное и однозначное "без мебели" (не единого упоминания мебели
+    # без отрицания) переключает вывод на "без мебели" вместо мебели по
+    # умолчанию
     text = "Сдаётся пустая квартира без мебели, только стены и окна."
-    assert "базовая мебель" not in rb.extract_amenities(text)
-
-
-def test_basic_furniture_not_confused_with_capital_city():
-    # "стол" в "столица"/"столичный" — не про мебель
-    text = "Уютная студия в центре Москвы, столица встречает гостей. Есть кондиционер."
     amenities = rb.extract_amenities(text)
-    assert "базовая мебель" not in amenities
-    assert amenities == ["кондиционер"]
+    assert amenities[0] == "без мебели"
+    assert "мебель" not in amenities
+
+
+def test_furniture_not_confused_with_capital_city():
+    # "стол" в "столица"/"столичный" не должен ложно засчитаться как
+    # отрицание мебели — регэксп не должен вообще матчить эти слова
+    assert rb.BASIC_FURNITURE_RE.search("В центре Москвы, столица встречает гостей.") is None
 
 
 # ==================== МЕТРО ====================
@@ -306,6 +317,27 @@ def test_zhk_address_not_duplicated_in_infrastructure():
     }
     message = rb.format_post_message(post)
     assert message.count("Руставели 14") == 1
+
+
+# ==================== ФОРМАТ СООБЩЕНИЯ ====================
+
+def test_price_line_is_bold():
+    post = {"text": "Сдам квартиру, 55000 руб, метро Сокольники", "link": "https://t.me/test/2"}
+    message = rb.format_post_message(post)
+    assert "💰 Цена: <b>55 000 руб</b>" in message
+
+
+def test_infrastructure_block_starts_with_ryadom():
+    post = {"text": "Сдам квартиру, рядом супермаркет и парк", "link": "https://t.me/test/3"}
+    message = rb.format_post_message(post)
+    assert "Инфраструктура:\nРядом " in message
+
+
+def test_concierge_not_shown_as_amenity():
+    text = "Сдам квартиру, консьерж на входе, кондиционер"
+    amenities = rb.extract_amenities(text)
+    assert "консьерж" not in amenities
+    assert "кондиционер" in amenities
 
 
 def test_address_combines_street_and_zhk_name():
