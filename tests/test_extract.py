@@ -620,3 +620,28 @@ def test_help_sends_full_command_list(monkeypatch):
     monkeypatch.setattr(rb, "send_telegram_message", lambda text, **kw: sent.append(text))
     rb.handle_command("/help")
     assert sent == [rb.HELP_TEXT]
+
+
+def test_digest_reattaches_reply_keyboard_to_photoless_post(monkeypatch, tmp_path):
+    # пользователь может случайно свернуть постоянную клавиатуру снизу
+    # (⚙️ Настроить фильтры / Сбросить фильтры) — она должна сама
+    # переприкрепляться к каждому посту без фото (к sendMediaGroup Telegram
+    # прикрепить клавиатуру не позволяет вообще, это ограничение самого API)
+    state_path = tmp_path / "state.json"
+    monkeypatch.setattr(rb, "STATE_PATH", str(state_path))
+    monkeypatch.setattr(rb, "STATE_LOCK_PATH", str(state_path) + ".lock")
+    monkeypatch.setattr(rb, "state", {"last_ids": {}})
+
+    calls = []
+    monkeypatch.setattr(
+        rb, "send_telegram_message",
+        lambda text, **kw: calls.append(kw.get("reply_markup")) or {"message_id": 1},
+    )
+
+    post = {
+        "id": 1, "channel": "chanA", "date": "", "datetime": None,
+        "text": "1-к квартира, 55000 руб", "link": "https://t.me/chanA/1", "photos": [],
+    }
+    rb.send_digest([post])
+
+    assert calls == [rb.MAIN_REPLY_KEYBOARD]

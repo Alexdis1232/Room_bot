@@ -1903,13 +1903,18 @@ def send_digest(posts):
 
         if len(photos) > 1:
             # альбом — все фото одним сообщением-группой, подпись вешаем на
-            # первое фото (Telegram не даёт подпись под каждым в отдельности)
+            # первое фото (Telegram не даёт подпись под каждым в отдельности).
+            # sendMediaGroup не поддерживает reply_markup вообще (ограничение
+            # самого Telegram Bot API) — постоянная клавиатура снизу
+            # (⚙️ Настроить фильтры / Сбросить фильтры) к альбому не
+            # прикрепляется, но она и так должна оставаться открытой у
+            # пользователя, пока он сам её не свернёт
             if fits_caption:
                 if send_telegram_media_group(photos, caption=message, parse_mode="HTML"):
                     continue
             else:
                 if send_telegram_media_group(photos):
-                    send_telegram_message(message, parse_mode="HTML")
+                    send_telegram_message(message, parse_mode="HTML", reply_markup=MAIN_REPLY_KEYBOARD)
                     continue
             # альбом не отправился (например, все ссылки на файлы устарели) —
             # пробуем как одно фото, а если и оно не выйдет — просто текстом
@@ -1918,13 +1923,13 @@ def send_digest(posts):
         photo_url = photos[0] if photos else None
 
         if photo_url and fits_caption:
-            if send_telegram_photo(photo_url, caption=message, parse_mode="HTML"):
+            if send_telegram_photo(photo_url, caption=message, parse_mode="HTML", reply_markup=MAIN_REPLY_KEYBOARD):
                 continue
             # не получилось с фото (например, ссылка на файл устарела) — шлём текстом
         elif photo_url:
             # текст не влезает в подпись — шлём фото отдельно, а следом полный текст
             if send_telegram_photo(photo_url):
-                send_telegram_message(message, parse_mode="HTML")
+                send_telegram_message(message, parse_mode="HTML", reply_markup=MAIN_REPLY_KEYBOARD)
                 continue
 
         if photo_url:
@@ -1932,7 +1937,7 @@ def send_digest(posts):
             # раньше это проходило совсем незаметно: пост тихо уходил
             # текстом, и по логу нельзя было понять, что фото вообще были
             log(f"Пост {p.get('link')} отправлен без фото — все попытки скачать/отправить не удались")
-        send_telegram_message(message, parse_mode="HTML")
+        send_telegram_message(message, parse_mode="HTML", reply_markup=MAIN_REPLY_KEYBOARD)
 
     _mark_as_sent(posts)
 
@@ -2011,12 +2016,14 @@ def _download_image(photo_url, label):
     return None
 
 
-def send_telegram_photo(photo_url, caption=None, parse_mode=None):
+def send_telegram_photo(photo_url, caption=None, parse_mode=None, reply_markup=None):
     data = {"chat_id": MY_CHAT_ID}
     if caption:
         data["caption"] = caption
     if parse_mode:
         data["parse_mode"] = parse_mode
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
     content = _download_image(photo_url, "фото для отправки")
     if content is None:
         return False
