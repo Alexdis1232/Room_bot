@@ -2211,6 +2211,16 @@ def handle_callback_query(cq):
 # Бот при каждом запуске проверяет, не написала ли ты ему команду —
 # так можно менять фильтры прямо из чата, без правки файлов.
 
+# приветствие для первого запуска (/start) — отдельно от HELP_TEXT
+# (полного списка команд), чтобы не заваливать нового пользователя сразу
+# командами: сначала коротко объяснить, что вообще делает бот
+WELCOME_TEXT = (
+    "🤖 Я бот-помощник — собираю объявления об аренде жилья (без комиссии) "
+    "в Москве и МО из десятков Telegram-каналов в одном месте.\n\n"
+    "Фильтры настраиваются прямо здесь, в чате — остаётся только ждать "
+    "объявлений."
+)
+
 HELP_TEXT = (
     "Доступные команды:\n\n"
     "/price мин макс — диапазон цены, например /price 0 50000\n"
@@ -2262,7 +2272,11 @@ def handle_command(text):
     cmd = parts[0].lower().split("@")[0]  # убираем "@имя_бота", если Telegram его добавил
     arg = parts[1].strip() if len(parts) > 1 else ""
 
-    if cmd == "/help" or cmd == "/start":
+    if cmd == "/start":
+        send_telegram_message(WELCOME_TEXT, reply_markup=MAIN_REPLY_KEYBOARD)
+        return
+
+    if cmd == "/help":
         send_telegram_message(HELP_TEXT, reply_markup=MAIN_REPLY_KEYBOARD)
         return
 

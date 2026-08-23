@@ -603,3 +603,20 @@ def test_double_post_merge_works_across_pagination_boundary():
 
     assert [p["id"] for p in posts] == [20]
     assert rb.extract_price(posts[0]["text"]) == 100000
+
+
+# ==================== КОМАНДЫ /start и /help ====================
+
+def test_start_sends_welcome_text_not_help_text(monkeypatch):
+    sent = []
+    monkeypatch.setattr(rb, "send_telegram_message", lambda text, **kw: sent.append(text))
+    rb.handle_command("/start")
+    assert sent == [rb.WELCOME_TEXT]
+    assert sent[0].startswith("🤖")
+
+
+def test_help_sends_full_command_list(monkeypatch):
+    sent = []
+    monkeypatch.setattr(rb, "send_telegram_message", lambda text, **kw: sent.append(text))
+    rb.handle_command("/help")
+    assert sent == [rb.HELP_TEXT]
