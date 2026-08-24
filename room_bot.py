@@ -2041,6 +2041,15 @@ def edit_message_reply_markup(chat_id, message_id, reply_markup):
     _telegram_api("editMessageReplyMarkup", data=data)
 
 
+def edit_message_text(chat_id, message_id, text, reply_markup=None, parse_mode=None):
+    data = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
+    if parse_mode:
+        data["parse_mode"] = parse_mode
+    _telegram_api("editMessageText", data=data)
+
+
 # сколько раз повторить скачивание фото при временном сбое (таймаут,
 # обрыв соединения) прежде чем сдаться — раньше единственная неудачная
 # попытка тихо превращала пост с альбомом в пост без единой фотографии
@@ -2193,6 +2202,73 @@ def build_filters_keyboard():
     return {"inline_keyboard": rows}
 
 
+# ==================== МАСТЕР НАСТРОЙКИ (для первого запуска) ====================
+# Тот же build_filters_keyboard() выдаёт бюджет+тип+округ одним большим
+# списком — удобно для повторной настройки, но для человека, который видит
+# бота впервые, это слишком много сразу. Мастер показывает те же самые
+# варианты, но по одному шагу за раз (тип жилья → цена → округ), с кнопкой
+# "Далее" — данные в итоге те же поля config["filters"], просто ввод
+# растянут на несколько сообщений вместо одного
+
+WIZARD_TYPE_TEXT = (
+    "Шаг 1 из 3. Какой тип жилья интересует?\n"
+    "Можно выбрать несколько — жми и жди ✅, потом «Далее»."
+)
+WIZARD_PRICE_TEXT = (
+    "Шаг 2 из 3. Какой бюджет?\n"
+    "Можно выбрать сразу несколько диапазонов."
+)
+WIZARD_OKRUG_TEXT = (
+    "Шаг 3 из 3. Какие округа?\n"
+    "Необязательно — если ничего не выбрать, подойдёт любой."
+)
+
+
+def build_wizard_type_keyboard():
+    selected_types = set(config["filters"].get("property_types", []))
+    rows, row = [], []
+    for i, t in enumerate(PROPERTY_TYPE_OPTIONS):
+        mark = "✅ " if t in selected_types else ""
+        row.append({"text": f"{mark}{t}", "callback_data": f"wiz_t{i}"})
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "Далее ▶️", "callback_data": "wiz_next_type"}])
+    return {"inline_keyboard": rows}
+
+
+def build_wizard_price_keyboard():
+    selected_budgets = {tuple(r) for r in config["filters"].get("price_ranges", [])}
+    rows, row = [], []
+    for i, (lo, hi) in enumerate(BUDGET_BRACKETS):
+        mark = "✅ " if (lo, hi) in selected_budgets else ""
+        row.append({"text": f"{mark}{_budget_label(lo, hi)}", "callback_data": f"wiz_b{i}"})
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "Далее ▶️", "callback_data": "wiz_next_price"}])
+    return {"inline_keyboard": rows}
+
+
+def build_wizard_okrug_keyboard():
+    selected_okrugs = set(config["filters"].get("okrugs", []))
+    rows, row = [], []
+    for i, o in enumerate(OKRUG_OPTIONS):
+        mark = "✅ " if o in selected_okrugs else ""
+        row.append({"text": f"{mark}{o}", "callback_data": f"wiz_o{i}"})
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "Готово ✅", "callback_data": "wiz_finish"}])
+    return {"inline_keyboard": rows}
+
+
 def filters_menu_text():
     return (
         "Настройка фильтров\n\n"
@@ -2221,6 +2297,95 @@ def handle_callback_query(cq):
 
     apply_requested = False
     filter_changed = False
+
+    # ---- мастер настройки для первого запуска (см. build_wizard_*) ----
+    # отдельная ветка от обычного меню фильтров ниже: каждый шаг мастера
+    # редактирует ТЕКСТ сообщения (переход на следующий шаг), а не только
+    # его клавиатуру, поэтому общий хвост функции (apply_requested/
+    # filter_changed/answer_callback_query) сюда не подходит — обрабатываем
+    # и выходим сразу
+    message_id = message.get("message_id")
+
+    if data == "wizard_start":
+        answer_callback_query(cq["id"])
+        if message_id:
+            edit_message_text(chat_id, message_id, WIZARD_TYPE_TEXT, reply_markup=build_wizard_type_keyboard())
+        return
+
+    if data.startswith("wiz_t"):
+        idx = int(data[len("wiz_t"):])
+        t = PROPERTY_TYPE_OPTIONS[idx]
+        types = config["filters"].get("property_types", [])
+        if t in types:
+            types.remove(t)
+        else:
+            types.append(t)
+        config["filters"]["property_types"] = types
+        save_json(CONFIG_PATH, config)
+        answer_callback_query(cq["id"])
+        if message_id:
+            edit_message_reply_markup(chat_id, message_id, build_wizard_type_keyboard())
+        return
+
+    if data == "wiz_next_type":
+        answer_callback_query(cq["id"])
+        if message_id:
+            edit_message_text(chat_id, message_id, WIZARD_PRICE_TEXT, reply_markup=build_wizard_price_keyboard())
+        return
+
+    if data.startswith("wiz_b"):
+        idx = int(data[len("wiz_b"):])
+        lo, hi = BUDGET_BRACKETS[idx]
+        ranges = [tuple(r) for r in config["filters"].get("price_ranges", [])]
+        if (lo, hi) in ranges:
+            ranges.remove((lo, hi))
+        else:
+            ranges.append((lo, hi))
+        config["filters"]["price_ranges"] = [list(r) for r in ranges]
+        save_json(CONFIG_PATH, config)
+        answer_callback_query(cq["id"])
+        if message_id:
+            edit_message_reply_markup(chat_id, message_id, build_wizard_price_keyboard())
+        return
+
+    if data == "wiz_next_price":
+        answer_callback_query(cq["id"])
+        if message_id:
+            edit_message_text(chat_id, message_id, WIZARD_OKRUG_TEXT, reply_markup=build_wizard_okrug_keyboard())
+        return
+
+    if data.startswith("wiz_o"):
+        idx = int(data[len("wiz_o"):])
+        o = OKRUG_OPTIONS[idx]
+        okrugs = config["filters"].get("okrugs", [])
+        if o in okrugs:
+            okrugs.remove(o)
+        else:
+            okrugs.append(o)
+        config["filters"]["okrugs"] = okrugs
+        save_json(CONFIG_PATH, config)
+        answer_callback_query(cq["id"])
+        if message_id:
+            edit_message_reply_markup(chat_id, message_id, build_wizard_okrug_keyboard())
+        return
+
+    if data == "wiz_finish":
+        answer_callback_query(cq["id"])
+        if message_id:
+            edit_message_text(
+                chat_id, message_id,
+                "Готово! Фильтры настроены — ищу подходящие объявления за последние 2 суток.\n\n"
+                "Поменять фильтры можно в любой момент кнопкой ⚙️ снизу.",
+            )
+        send_telegram_message("Кнопки для дальнейшей настройки — снизу.", reply_markup=MAIN_REPLY_KEYBOARD)
+        current_snapshot = {
+            "price_ranges": [list(r) for r in config["filters"].get("price_ranges", [])],
+            "property_types": list(config["filters"].get("property_types", [])),
+            "okrugs": list(config["filters"].get("okrugs", [])),
+        }
+        save_state(last_applied_filters=current_snapshot)
+        _schedule_recent_scan(delay=0.5)
+        return
 
     if data.startswith("fb"):
         idx = int(data[2:])
@@ -2293,20 +2458,6 @@ def handle_callback_query(cq):
 # Бот при каждом запуске проверяет, не написала ли ты ему команду —
 # так можно менять фильтры прямо из чата, без правки файлов.
 
-# приветствие для первого запуска (/start) — отдельно от HELP_TEXT
-# (полного списка команд), чтобы не заваливать нового пользователя сразу
-# командами: сначала коротко объяснить, что вообще делает бот
-WELCOME_TEXT = (
-    "🤖 Я бот-помощник — собираю объявления об аренде жилья в Москве и МО "
-    "из десятков Telegram-каналов в одном месте.\n\n"
-    "Фильтры настраиваются прямо здесь, в чате: тип жилья, диапазон цен, "
-    "районы — дальше остаётся только ждать объявлений."
-)
-
-# картинка-обложка к приветствию (логотип как есть, без обработки) —
-# лежит рядом с самим скриптом, в assets/
-WELCOME_IMAGE_PATH = os.path.join(os.path.dirname(__file__), "assets", "welcome.jpg")
-
 HELP_TEXT = (
     "Доступные команды:\n\n"
     "/price мин макс — диапазон цены, например /price 0 50000\n"
@@ -2359,13 +2510,17 @@ def handle_command(text):
     arg = parts[1].strip() if len(parts) > 1 else ""
 
     if cmd == "/start":
-        sent = False
-        if os.path.exists(WELCOME_IMAGE_PATH):
-            sent = send_telegram_photo_file(
-                WELCOME_IMAGE_PATH, caption=WELCOME_TEXT, reply_markup=MAIN_REPLY_KEYBOARD
-            )
-        if not sent:
-            send_telegram_message(WELCOME_TEXT, reply_markup=MAIN_REPLY_KEYBOARD)
+        # для первого запуска — коротко, без сразу всего текста/меню
+        # фильтров разом: короткое приветствие с одной кнопкой, которая
+        # запускает пошаговый мастер (см. build_wizard_*). Нижняя постоянная
+        # клавиатура (⚙️ Настроить/Сбросить фильтры) намеренно не
+        # показывается здесь — появится только после прохождения мастера
+        send_telegram_message(
+            "Привет! 🤖 Давай настроим тебе фильтры.",
+            reply_markup={
+                "inline_keyboard": [[{"text": "Настроить фильтры", "callback_data": "wizard_start"}]]
+            },
+        )
         return
 
     if cmd == "/help":

@@ -148,34 +148,19 @@ def test_sync_assets_survives_network_error(monkeypatch, tmp_path):
     assert not (tmp_path / "assets" / "welcome.jpg").exists()
 
 
-def test_start_sends_welcome_photo_with_caption(monkeypatch, tmp_path):
-    image_path = tmp_path / "welcome.jpg"
+def test_send_telegram_photo_file_reads_local_bytes(monkeypatch, tmp_path):
+    # общая утилита остаётся полезной сама по себе (например для будущих
+    # функций), даже раз /start больше не шлёт фото — проверяем, что она
+    # реально читает файл с диска и передаёт его в _telegram_api
+    image_path = tmp_path / "pic.jpg"
     image_path.write_bytes(b"\xff\xd8\xff-fake-jpeg")
-    monkeypatch.setattr(rb, "WELCOME_IMAGE_PATH", str(image_path))
 
     calls = []
-    monkeypatch.setattr(
-        rb, "send_telegram_photo_file",
-        lambda path, **kw: calls.append((path, kw.get("caption"), kw.get("reply_markup"))) or True,
-    )
-    sent_text = []
-    monkeypatch.setattr(rb, "send_telegram_message", lambda text, **kw: sent_text.append(text))
+    monkeypatch.setattr(rb, "_telegram_api", lambda method, **kw: calls.append((method, kw)) or {"ok": True})
 
-    rb.handle_command("/start")
-
-    assert calls == [(str(image_path), rb.WELCOME_TEXT, rb.MAIN_REPLY_KEYBOARD)]
-    assert sent_text == []  # текстом отдельно слать не нужно, раз фото ушло
-
-
-def test_start_falls_back_to_text_when_photo_send_fails(monkeypatch, tmp_path):
-    image_path = tmp_path / "welcome.jpg"
-    image_path.write_bytes(b"\xff\xd8\xff-fake-jpeg")
-    monkeypatch.setattr(rb, "WELCOME_IMAGE_PATH", str(image_path))
-    monkeypatch.setattr(rb, "send_telegram_photo_file", lambda path, **kw: False)
-
-    sent_text = []
-    monkeypatch.setattr(rb, "send_telegram_message", lambda text, **kw: sent_text.append(text))
-
-    rb.handle_command("/start")
-
-    assert sent_text == [rb.WELCOME_TEXT]
+    ok = rb.send_telegram_photo_file(str(image_path), caption="подпись")
+    assert ok is True
+    method, kw = calls[0]
+    assert method == "sendPhoto"
+    assert kw["data"]["caption"] == "подпись"
+    assert kw["files"]["photo"][1] == b"\xff\xd8\xff-fake-jpeg"
