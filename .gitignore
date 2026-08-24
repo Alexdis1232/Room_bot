@@ -3,6 +3,7 @@ __pycache__/
 .pytest_cache/
 state.json
 state.json.lock
+users.json
 bot.log
 emoji_ids.log
 *.env

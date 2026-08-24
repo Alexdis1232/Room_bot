@@ -129,37 +129,113 @@ def save_state(**changed):
     return _update_state_locked(lambda fresh: fresh.update(changed))
 
 
+def _save_user_last_applied_filters(chat_id, snapshot):
+    chat_id = str(chat_id)
+
+    def _apply(fresh):
+        fresh.setdefault("users", {}).setdefault(chat_id, {})["last_applied_filters"] = snapshot
+
+    _update_state_locked(_apply)
+
+
 DEFAULT_CONFIG = {
     "channels": [
         "example_channel_1",
         "example_channel_2"
     ],
-    "filters": {
-        "keywords_include": ["сдам"],
-        "keywords_exclude": ["куплю", "ищу", "студи"],
-        "price_min": 70000,
-        "price_max": 100000,
-        "price_ranges": [],
-        "property_types": [],
-        "okrugs": [],
-        "rooms": [2],
-        "districts": [],
-        "metro_max_minutes": 15
-    }
 }
+
+# фильтры каждого пользователя, кто пока не проходил мастер настройки —
+# максимально открытые (ничего не отсекают, кроме базового "это объявление
+# о сдаче"), чтобы новый человек до прохождения мастера не терял объявления
+# из-за чужих старых предпочтений
+DEFAULT_FILTERS = {
+    "keywords_include": ["сдам"],
+    "keywords_exclude": ["куплю", "ищу", "студи"],
+    "price_min": 0,
+    "price_max": 10_000_000,
+    "price_ranges": [],
+    "property_types": [],
+    "okrugs": [],
+    "rooms": [],
+    "districts": [],
+    "metro_max_minutes": None,
+}
+
+USERS_PATH = os.path.join(os.path.dirname(__file__), "users.json")
 
 config = load_json(CONFIG_PATH, DEFAULT_CONFIG)
 if not os.path.exists(CONFIG_PATH):
     save_json(CONFIG_PATH, config)
 
-# у существующего config.json может не быть новых полей (кнопочное меню
-# бюджета/типа жилья/округа) — доливаем значения по умолчанию, не трогая
-# остальное
-config["filters"].setdefault("price_ranges", [])
-config["filters"].setdefault("property_types", [])
-config["filters"].setdefault("okrugs", [])
-
 state = load_json(STATE_PATH, {"last_ids": {}})
+users = load_json(USERS_PATH, {})
+
+
+def _migrate_single_user_data_to_multi_user():
+    # раньше бот знал только одного человека (MY_CHAT_ID) — общий
+    # config["filters"] и общие state["sent_post_ids"]/["seen_word_lists"]/
+    # ["last_applied_filters"]. Чтобы переход на многопользовательский режим
+    # не "обнулил" её уже настроенные фильтры и не прислал заново все её
+    # уже полученные объявления — переносим эти данные в новую
+    # персональную структуру один раз при первом запуске новой версии
+    global config, state, users
+    changed_config = False
+    changed_state = False
+    changed_users = False
+
+    legacy_filters = config.pop("filters", None)
+    if legacy_filters is not None:
+        changed_config = True
+        if MY_CHAT_ID and MY_CHAT_ID not in users:
+            legacy_filters.setdefault("price_ranges", [])
+            legacy_filters.setdefault("property_types", [])
+            legacy_filters.setdefault("okrugs", [])
+            users[MY_CHAT_ID] = {"filters": legacy_filters}
+            changed_users = True
+
+    legacy_keys = ("sent_post_ids", "seen_word_lists", "last_applied_filters")
+    if MY_CHAT_ID and any(k in state for k in legacy_keys):
+        user_state = state.setdefault("users", {}).setdefault(MY_CHAT_ID, {})
+        for key in legacy_keys:
+            if key in state:
+                user_state.setdefault(key, state.pop(key))
+        changed_state = True
+
+    if changed_config:
+        save_json(CONFIG_PATH, config)
+    if changed_state:
+        save_json(STATE_PATH, state)
+    if changed_users:
+        save_json(USERS_PATH, users)
+
+
+_migrate_single_user_data_to_multi_user()
+
+
+def register_user(chat_id):
+    # гарантирует, что у пользователя есть запись с фильтрами — вызывается
+    # при любом первом обращении (сообщение или нажатие кнопки), чтобы
+    # мастер настройки и команды всегда было куда сохранять выбор
+    chat_id = str(chat_id)
+    if chat_id not in users:
+        users[chat_id] = {"filters": copy.deepcopy(DEFAULT_FILTERS)}
+        save_json(USERS_PATH, users)
+    else:
+        users[chat_id].setdefault("filters", copy.deepcopy(DEFAULT_FILTERS))
+    return users[chat_id]
+
+
+def get_user_filters(chat_id):
+    return register_user(chat_id)["filters"]
+
+
+def save_users():
+    save_json(USERS_PATH, users)
+
+
+def registered_chat_ids():
+    return list(users.keys())
 
 
 # ==================== ФИЛЬТРАЦИЯ ====================
@@ -1656,11 +1732,12 @@ def fetch_channel_posts_since(channel, cutoff_dt, max_pages=15):
     return _merge_price_continuation_posts(all_posts)
 
 
-_pending_scan_timer = None
+# отдельный таймер debounce на каждого пользователя (chat_id -> Timer)
+_pending_scan_timers = {}
 _scan_lock = threading.Lock()
 
 
-def _run_recent_scan(channels, filters):
+def _run_recent_scan(chat_id, channels, filters):
     # запускается таймером в отдельном потоке (см. _schedule_recent_scan) —
     # необработанное исключение здесь НЕ попадёт ни в try/except вокруг
     # main() (он ловит только свой, главный поток), ни в лог: threading
@@ -1670,36 +1747,39 @@ def _run_recent_scan(channels, filters):
     # "Применить" (например, сеть отвалилась на середине) означала полную
     # тишину: ни сообщения с результатом, ни следа в bot.log
     try:
-        send_recent_matching_ads(channels=channels, filters=filters)
+        send_recent_matching_ads(chat_id, channels=channels, filters=filters)
     except Exception as e:
-        log(f"Ошибка при скане по кнопке 'Применить': {e}")
-        send_telegram_message(f"Не удалось выполнить поиск по фильтру: {e}")
+        log(f"Ошибка при скане по кнопке 'Применить' (chat_id={chat_id}): {e}")
+        send_telegram_message(chat_id, f"Не удалось выполнить поиск по фильтру: {e}")
 
 
-def _schedule_recent_scan(delay=3.0):
+def _schedule_recent_scan(chat_id, delay=3.0):
     # сканирование каналов может занять много времени (постраничная
     # подгрузка истории), поэтому запускаем в фоновом потоке — иначе
     # слушатель не сможет обработать следующие нажатия/команды, пока
-    # скан не закончится. Debounce: несколько нажатий подряд (например,
-    # отметили сразу 3 галочки) откладывают запуск, а не плодят по скану
-    # на каждое нажатие — сработает только последний, спустя `delay` сек
-    # тишины
-    global _pending_scan_timer
+    # скан не закончится. Debounce: несколько нажатий подряд одного и того
+    # же пользователя (например, отметили сразу 3 галочки) откладывают
+    # запуск, а не плодят по скану на каждое нажатие — сработает только
+    # последний, спустя `delay` сек тишины. У каждого пользователя — свой
+    # таймер, чтобы скан по кнопке одного не отменял ожидающий скан другого
+    chat_id = str(chat_id)
     # снимок фильтров/каналов делаем СЕЙЧАС, в вызывающем потоке — иначе
-    # фоновый таймер читал бы общий config уже во время скана, пока
-    # основной поток мог успеть изменить его новым нажатием кнопки
+    # фоновый таймер читал бы общие данные уже во время скана, пока
+    # основной поток мог успеть изменить их новым нажатием кнопки
     channels_snapshot = list(config["channels"])
-    filters_snapshot = copy.deepcopy(config["filters"])
+    filters_snapshot = copy.deepcopy(get_user_filters(chat_id))
     with _scan_lock:
-        if _pending_scan_timer is not None:
-            _pending_scan_timer.cancel()
-        _pending_scan_timer = threading.Timer(
+        existing = _pending_scan_timers.get(chat_id)
+        if existing is not None:
+            existing.cancel()
+        timer = threading.Timer(
             delay,
             _run_recent_scan,
-            kwargs={"channels": channels_snapshot, "filters": filters_snapshot},
+            kwargs={"chat_id": chat_id, "channels": channels_snapshot, "filters": filters_snapshot},
         )
-        _pending_scan_timer.daemon = True
-        _pending_scan_timer.start()
+        timer.daemon = True
+        _pending_scan_timers[chat_id] = timer
+        timer.start()
 
 
 def _post_key(post):
@@ -1717,21 +1797,24 @@ def _post_key(post):
 SENT_POST_IDS_LIMIT = 1000
 
 
-def send_recent_matching_ads(hours=48, channels=None, filters=None):
+def send_recent_matching_ads(chat_id, hours=48, channels=None, filters=None):
     # после смены фильтра пользователем — сразу показываем всё подходящее
     # за последние `hours`, а не ждать следующего планового скана каналов
+    chat_id = str(chat_id)
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     if channels is None:
         channels = config["channels"]
     if filters is None:
-        filters = config["filters"]
+        filters = get_user_filters(chat_id)
 
     # читаем свежим с диска, а не из общего state в памяти — этот вызов
     # часто идёт из непрерывного слушателя, чей state в памяти мог устареть
     # за время его работы (плановый скан обновляет sent_post_ids отдельным
     # процессом). Саму пометку "отправлено" ставит send_digest — здесь
-    # только фильтруем то, что уже отправлялось раньше
-    sent_ids_set = set(load_json(STATE_PATH, {}).get("sent_post_ids", []))
+    # только фильтруем то, что уже отправлялось раньше ЭТОМУ пользователю
+    sent_ids_set = set(
+        load_json(STATE_PATH, {}).get("users", {}).get(chat_id, {}).get("sent_post_ids", [])
+    )
 
     matches = []
     seen_word_lists = []
@@ -1756,14 +1839,21 @@ def send_recent_matching_ads(hours=48, channels=None, filters=None):
             matches.append(post)
 
     if not matches:
-        send_telegram_message(f"По новому фильтру за последние {hours} ч. подходящих объявлений не нашлось.")
+        send_telegram_message(chat_id, f"По новому фильтру за последние {hours} ч. подходящих объявлений не нашлось.")
         return
 
-    send_telegram_message(f"По новому фильтру за последние {hours} ч. нашлось: {len(matches)}")
-    send_digest(matches)
+    send_telegram_message(chat_id, f"По новому фильтру за последние {hours} ч. нашлось: {len(matches)}")
+    send_digest(chat_id, matches)
 
 
-def fetch_new_posts(channels, filters):
+def fetch_new_posts(channels):
+    # раньше эта функция сразу же и фильтровала посты под единственный
+    # глобальный config["filters"] — теперь у каждого пользователя свой
+    # фильтр, поэтому здесь только сканируем каналы и отсеиваем то, что не
+    # ново (по last_ids) и повторные репосты одного и того же объявления
+    # в разных каналах (по seen_word_lists, это свойство самого поста, а
+    # не чьего-то персонального фильтра). Кому из пользователей какой пост
+    # подходит — решает dispatch_posts_to_users() уже после этого вызова
     results = []
     # читаем свежим с диска на случай, если непрерывный слушатель (другой
     # процесс) успел что-то обновить в state.json уже после запуска этого
@@ -1775,9 +1865,6 @@ def fetch_new_posts(channels, filters):
     # и не даёт файлу состояния разрастаться
     seen_word_lists = fresh_state.get("seen_word_lists", [])[-300:]
     new_word_lists = []
-    # саму пометку "отправлено" ставит send_digest — здесь только
-    # фильтруем то, что уже отправлялось раньше (любым путём)
-    sent_ids_set = set(fresh_state.get("sent_post_ids", []))
 
     for channel in channels:
         try:
@@ -1794,17 +1881,9 @@ def fetch_new_posts(channels, filters):
                 continue
             max_id_seen = max(max_id_seen, post["id"])
 
-            if not matches_filters(post["text"], filters, has_photos=bool(post.get("photos"))):
-                continue
-
-            if _post_key(post) in sent_ids_set:
-                # уже отправляли этот пост через ручное "Применить" —
-                # плановый скан не должен присылать его снова
-                continue
-
             words = extract_signature_words(post["text"])
             if is_duplicate(words, seen_word_lists + new_word_lists):
-                # похожее объявление уже присылали из другого канала
+                # похожее объявление уже видели из другого канала
                 continue
 
             new_word_lists.append(list(words))
@@ -1817,6 +1896,27 @@ def fetch_new_posts(channels, filters):
         seen_word_lists=(seen_word_lists + new_word_lists)[-300:],
     )
     return results
+
+
+def dispatch_posts_to_users(posts):
+    # плановый скан находит посты один раз для всех (общая инфраструктура —
+    # каналы одни и те же для всех пользователей), а дальше каждый
+    # зарегистрированный пользователь получает только то, что подходит под
+    # ЕГО фильтр и ещё не отправлялось лично ему
+    if not posts:
+        return
+    for chat_id in list(users.keys()):
+        filters = get_user_filters(chat_id)
+        fresh_sent_ids = set(
+            load_json(STATE_PATH, {}).get("users", {}).get(chat_id, {}).get("sent_post_ids", [])
+        )
+        matches = [
+            p for p in posts
+            if _post_key(p) not in fresh_sent_ids
+            and matches_filters(p["text"], filters, has_photos=bool(p.get("photos")))
+        ]
+        if matches:
+            send_digest(chat_id, matches)
 
 
 # ==================== ОТПРАВКА ЧЕРЕЗ БОТА ====================
@@ -1922,15 +2022,18 @@ def format_post_message(p):
 TELEGRAM_CAPTION_LIMIT = 1024
 
 
-def _mark_as_sent(posts):
+def _mark_as_sent(chat_id, posts):
     # помечаем посты отправленными ЗДЕСЬ, внутри send_digest, а не в коде,
     # который её вызывает — раньше это делали отдельно fetch_new_posts и
     # send_recent_matching_ads, и любой другой вызов send_digest (например,
     # разовая ручная отправка примера объявления) эту отметку пропускал,
     # из-за чего такой пост мог потом снова найтись плановым сканом или
-    # "Применить" и уйти пользователю второй раз
+    # "Применить" и уйти пользователю второй раз. sent_post_ids теперь
+    # персональный для каждого chat_id — то, что уже видел один
+    # пользователь, не должно скрывать пост от другого
     if not posts:
         return
+    chat_id = str(chat_id)
     keys = [_post_key(p) for p in posts]
 
     # чтение текущего sent_post_ids, вычисление новых ключей и запись — всё
@@ -1941,16 +2044,19 @@ def _mark_as_sent(posts):
     # только что добавленные id стирались следующей записью отсюда, пост
     # "забывался" отправленным и уходил повторно
     def _apply(fresh):
-        sent_ids_list = fresh.get("sent_post_ids", [])
+        users_state = fresh.setdefault("users", {})
+        user_state = users_state.setdefault(chat_id, {})
+        sent_ids_list = user_state.get("sent_post_ids", [])
         sent_ids_set = set(sent_ids_list)
         new_keys = [k for k in keys if k not in sent_ids_set]
         if new_keys:
-            fresh["sent_post_ids"] = (sent_ids_list + new_keys)[-SENT_POST_IDS_LIMIT:]
+            user_state["sent_post_ids"] = (sent_ids_list + new_keys)[-SENT_POST_IDS_LIMIT:]
 
     _update_state_locked(_apply)
 
 
-def send_digest(posts):
+def send_digest(chat_id, posts):
+    chat_id = str(chat_id)
     for p in posts:
         message = format_post_message(p)
         photos = p.get("photos") or []
@@ -1965,11 +2071,11 @@ def send_digest(posts):
             # прикрепляется, но она и так должна оставаться открытой у
             # пользователя, пока он сам её не свернёт
             if fits_caption:
-                if send_telegram_media_group(photos, caption=message, parse_mode="HTML"):
+                if send_telegram_media_group(chat_id, photos, caption=message, parse_mode="HTML"):
                     continue
             else:
-                if send_telegram_media_group(photos):
-                    send_telegram_message(message, parse_mode="HTML", reply_markup=MAIN_REPLY_KEYBOARD)
+                if send_telegram_media_group(chat_id, photos):
+                    send_telegram_message(chat_id, message, parse_mode="HTML", reply_markup=MAIN_REPLY_KEYBOARD)
                     continue
             # альбом не отправился (например, все ссылки на файлы устарели) —
             # пробуем как одно фото, а если и оно не выйдет — просто текстом
@@ -1978,13 +2084,13 @@ def send_digest(posts):
         photo_url = photos[0] if photos else None
 
         if photo_url and fits_caption:
-            if send_telegram_photo(photo_url, caption=message, parse_mode="HTML", reply_markup=MAIN_REPLY_KEYBOARD):
+            if send_telegram_photo(chat_id, photo_url, caption=message, parse_mode="HTML", reply_markup=MAIN_REPLY_KEYBOARD):
                 continue
             # не получилось с фото (например, ссылка на файл устарела) — шлём текстом
         elif photo_url:
             # текст не влезает в подпись — шлём фото отдельно, а следом полный текст
-            if send_telegram_photo(photo_url):
-                send_telegram_message(message, parse_mode="HTML", reply_markup=MAIN_REPLY_KEYBOARD)
+            if send_telegram_photo(chat_id, photo_url):
+                send_telegram_message(chat_id, message, parse_mode="HTML", reply_markup=MAIN_REPLY_KEYBOARD)
                 continue
 
         if photo_url:
@@ -1992,9 +2098,9 @@ def send_digest(posts):
             # раньше это проходило совсем незаметно: пост тихо уходил
             # текстом, и по логу нельзя было понять, что фото вообще были
             log(f"Пост {p.get('link')} отправлен без фото — все попытки скачать/отправить не удались")
-        send_telegram_message(message, parse_mode="HTML", reply_markup=MAIN_REPLY_KEYBOARD)
+        send_telegram_message(chat_id, message, parse_mode="HTML", reply_markup=MAIN_REPLY_KEYBOARD)
 
-    _mark_as_sent(posts)
+    _mark_as_sent(chat_id, posts)
 
 
 def _telegram_api(method, data=None, files=None, timeout=15):
@@ -2013,11 +2119,11 @@ def _telegram_api(method, data=None, files=None, timeout=15):
         return None
 
 
-def send_telegram_message(text, parse_mode=None, reply_markup=None):
+def send_telegram_message(chat_id, text, parse_mode=None, reply_markup=None):
     # без disable_web_page_preview на ссылку "Источник" Telegram сам
     # подтягивает большое превью с фото и текстом исходного канала — оно
     # перекрывает нашу карточку
-    data = {"chat_id": MY_CHAT_ID, "text": text, "disable_web_page_preview": True}
+    data = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
     if parse_mode:
         data["parse_mode"] = parse_mode
     if reply_markup:
@@ -2080,8 +2186,8 @@ def _download_image(photo_url, label):
     return None
 
 
-def send_telegram_photo(photo_url, caption=None, parse_mode=None, reply_markup=None):
-    data = {"chat_id": MY_CHAT_ID}
+def send_telegram_photo(chat_id, photo_url, caption=None, parse_mode=None, reply_markup=None):
+    data = {"chat_id": chat_id}
     if caption:
         data["caption"] = caption
     if parse_mode:
@@ -2095,10 +2201,10 @@ def send_telegram_photo(photo_url, caption=None, parse_mode=None, reply_markup=N
     return _telegram_api("sendPhoto", data=data, files=files, timeout=20) is not None
 
 
-def send_telegram_photo_file(path, caption=None, parse_mode=None, reply_markup=None):
+def send_telegram_photo_file(chat_id, path, caption=None, parse_mode=None, reply_markup=None):
     # для локальных картинок бота (например обложка приветствия) — файл
     # уже лежит на диске рядом со скриптом, скачивать по URL не нужно
-    data = {"chat_id": MY_CHAT_ID}
+    data = {"chat_id": chat_id}
     if caption:
         data["caption"] = caption
     if parse_mode:
@@ -2115,7 +2221,7 @@ def send_telegram_photo_file(path, caption=None, parse_mode=None, reply_markup=N
     return _telegram_api("sendPhoto", data=data, files=files, timeout=20) is not None
 
 
-def send_telegram_media_group(photo_urls, caption=None, parse_mode=None):
+def send_telegram_media_group(chat_id, photo_urls, caption=None, parse_mode=None):
     # Telegram принимает максимум 10 фото в одной группе
     photo_urls = photo_urls[:10]
 
@@ -2137,7 +2243,7 @@ def send_telegram_media_group(photo_urls, caption=None, parse_mode=None):
     if not media:
         return False
 
-    data = {"chat_id": MY_CHAT_ID, "media": json.dumps(media)}
+    data = {"chat_id": chat_id, "media": json.dumps(media)}
     return _telegram_api("sendMediaGroup", data=data, files=files, timeout=40) is not None
 
 
@@ -2162,10 +2268,11 @@ def _budget_label(lo, hi):
     return f"{lo // 1000}–{hi // 1000}т"
 
 
-def build_filters_keyboard():
-    selected_budgets = {tuple(r) for r in config["filters"].get("price_ranges", [])}
-    selected_types = set(config["filters"].get("property_types", []))
-    selected_okrugs = set(config["filters"].get("okrugs", []))
+def build_filters_keyboard(chat_id):
+    filters = get_user_filters(chat_id)
+    selected_budgets = {tuple(r) for r in filters.get("price_ranges", [])}
+    selected_types = set(filters.get("property_types", []))
+    selected_okrugs = set(filters.get("okrugs", []))
 
     rows = []
     row = []
@@ -2224,8 +2331,8 @@ WIZARD_OKRUG_TEXT = (
 )
 
 
-def build_wizard_type_keyboard():
-    selected_types = set(config["filters"].get("property_types", []))
+def build_wizard_type_keyboard(chat_id):
+    selected_types = set(get_user_filters(chat_id).get("property_types", []))
     rows, row = [], []
     for i, t in enumerate(PROPERTY_TYPE_OPTIONS):
         mark = "✅ " if t in selected_types else ""
@@ -2239,8 +2346,8 @@ def build_wizard_type_keyboard():
     return {"inline_keyboard": rows}
 
 
-def build_wizard_price_keyboard():
-    selected_budgets = {tuple(r) for r in config["filters"].get("price_ranges", [])}
+def build_wizard_price_keyboard(chat_id):
+    selected_budgets = {tuple(r) for r in get_user_filters(chat_id).get("price_ranges", [])}
     rows, row = [], []
     for i, (lo, hi) in enumerate(BUDGET_BRACKETS):
         mark = "✅ " if (lo, hi) in selected_budgets else ""
@@ -2254,8 +2361,8 @@ def build_wizard_price_keyboard():
     return {"inline_keyboard": rows}
 
 
-def build_wizard_okrug_keyboard():
-    selected_okrugs = set(config["filters"].get("okrugs", []))
+def build_wizard_okrug_keyboard(chat_id):
+    selected_okrugs = set(get_user_filters(chat_id).get("okrugs", []))
     rows, row = [], []
     for i, o in enumerate(OKRUG_OPTIONS):
         mark = "✅ " if o in selected_okrugs else ""
@@ -2282,18 +2389,19 @@ def filters_menu_text():
     )
 
 
-def show_filters_menu():
+def show_filters_menu(chat_id):
     # постоянная кнопка снизу выставляется этим же сообщением и остаётся
     # висеть до следующей отправки другой reply-клавиатуры
-    send_telegram_message(filters_menu_text(), reply_markup=build_filters_keyboard())
+    send_telegram_message(chat_id, filters_menu_text(), reply_markup=build_filters_keyboard(chat_id))
 
 
 def handle_callback_query(cq):
     data = cq.get("data", "")
     message = cq.get("message") or {}
     chat_id = str((message.get("chat") or {}).get("id", ""))
-    if chat_id != str(MY_CHAT_ID):
+    if not chat_id:
         return
+    register_user(chat_id)
 
     apply_requested = False
     filter_changed = False
@@ -2306,67 +2414,69 @@ def handle_callback_query(cq):
     # и выходим сразу
     message_id = message.get("message_id")
 
+    filters = get_user_filters(chat_id)
+
     if data == "wizard_start":
         answer_callback_query(cq["id"])
         if message_id:
-            edit_message_text(chat_id, message_id, WIZARD_TYPE_TEXT, reply_markup=build_wizard_type_keyboard())
+            edit_message_text(chat_id, message_id, WIZARD_TYPE_TEXT, reply_markup=build_wizard_type_keyboard(chat_id))
         return
 
     if data.startswith("wiz_t"):
         idx = int(data[len("wiz_t"):])
         t = PROPERTY_TYPE_OPTIONS[idx]
-        types = config["filters"].get("property_types", [])
+        types = filters.get("property_types", [])
         if t in types:
             types.remove(t)
         else:
             types.append(t)
-        config["filters"]["property_types"] = types
-        save_json(CONFIG_PATH, config)
+        filters["property_types"] = types
+        save_users()
         answer_callback_query(cq["id"])
         if message_id:
-            edit_message_reply_markup(chat_id, message_id, build_wizard_type_keyboard())
+            edit_message_reply_markup(chat_id, message_id, build_wizard_type_keyboard(chat_id))
         return
 
     if data == "wiz_next_type":
         answer_callback_query(cq["id"])
         if message_id:
-            edit_message_text(chat_id, message_id, WIZARD_PRICE_TEXT, reply_markup=build_wizard_price_keyboard())
+            edit_message_text(chat_id, message_id, WIZARD_PRICE_TEXT, reply_markup=build_wizard_price_keyboard(chat_id))
         return
 
     if data.startswith("wiz_b"):
         idx = int(data[len("wiz_b"):])
         lo, hi = BUDGET_BRACKETS[idx]
-        ranges = [tuple(r) for r in config["filters"].get("price_ranges", [])]
+        ranges = [tuple(r) for r in filters.get("price_ranges", [])]
         if (lo, hi) in ranges:
             ranges.remove((lo, hi))
         else:
             ranges.append((lo, hi))
-        config["filters"]["price_ranges"] = [list(r) for r in ranges]
-        save_json(CONFIG_PATH, config)
+        filters["price_ranges"] = [list(r) for r in ranges]
+        save_users()
         answer_callback_query(cq["id"])
         if message_id:
-            edit_message_reply_markup(chat_id, message_id, build_wizard_price_keyboard())
+            edit_message_reply_markup(chat_id, message_id, build_wizard_price_keyboard(chat_id))
         return
 
     if data == "wiz_next_price":
         answer_callback_query(cq["id"])
         if message_id:
-            edit_message_text(chat_id, message_id, WIZARD_OKRUG_TEXT, reply_markup=build_wizard_okrug_keyboard())
+            edit_message_text(chat_id, message_id, WIZARD_OKRUG_TEXT, reply_markup=build_wizard_okrug_keyboard(chat_id))
         return
 
     if data.startswith("wiz_o"):
         idx = int(data[len("wiz_o"):])
         o = OKRUG_OPTIONS[idx]
-        okrugs = config["filters"].get("okrugs", [])
+        okrugs = filters.get("okrugs", [])
         if o in okrugs:
             okrugs.remove(o)
         else:
             okrugs.append(o)
-        config["filters"]["okrugs"] = okrugs
-        save_json(CONFIG_PATH, config)
+        filters["okrugs"] = okrugs
+        save_users()
         answer_callback_query(cq["id"])
         if message_id:
-            edit_message_reply_markup(chat_id, message_id, build_wizard_okrug_keyboard())
+            edit_message_reply_markup(chat_id, message_id, build_wizard_okrug_keyboard(chat_id))
         return
 
     if data == "wiz_finish":
@@ -2377,54 +2487,54 @@ def handle_callback_query(cq):
                 "Готово! Фильтры настроены — ищу подходящие объявления за последние 2 суток.\n\n"
                 "Поменять фильтры можно в любой момент кнопкой ⚙️ снизу.",
             )
-        send_telegram_message("Кнопки для дальнейшей настройки — снизу.", reply_markup=MAIN_REPLY_KEYBOARD)
+        send_telegram_message(chat_id, "Кнопки для дальнейшей настройки — снизу.", reply_markup=MAIN_REPLY_KEYBOARD)
         current_snapshot = {
-            "price_ranges": [list(r) for r in config["filters"].get("price_ranges", [])],
-            "property_types": list(config["filters"].get("property_types", [])),
-            "okrugs": list(config["filters"].get("okrugs", [])),
+            "price_ranges": [list(r) for r in filters.get("price_ranges", [])],
+            "property_types": list(filters.get("property_types", [])),
+            "okrugs": list(filters.get("okrugs", [])),
         }
-        save_state(last_applied_filters=current_snapshot)
-        _schedule_recent_scan(delay=0.5)
+        _save_user_last_applied_filters(chat_id, current_snapshot)
+        _schedule_recent_scan(chat_id, delay=0.5)
         return
 
     if data.startswith("fb"):
         idx = int(data[2:])
         lo, hi = BUDGET_BRACKETS[idx]
-        ranges = [tuple(r) for r in config["filters"].get("price_ranges", [])]
+        ranges = [tuple(r) for r in filters.get("price_ranges", [])]
         if (lo, hi) in ranges:
             ranges.remove((lo, hi))
         else:
             ranges.append((lo, hi))
-        config["filters"]["price_ranges"] = [list(r) for r in ranges]
-        save_json(CONFIG_PATH, config)
+        filters["price_ranges"] = [list(r) for r in ranges]
+        save_users()
 
     elif data.startswith("ft"):
         idx = int(data[2:])
         t = PROPERTY_TYPE_OPTIONS[idx]
-        types = config["filters"].get("property_types", [])
+        types = filters.get("property_types", [])
         if t in types:
             types.remove(t)
         else:
             types.append(t)
-        config["filters"]["property_types"] = types
-        save_json(CONFIG_PATH, config)
+        filters["property_types"] = types
+        save_users()
 
     elif data.startswith("fo"):
         idx = int(data[2:])
         o = OKRUG_OPTIONS[idx]
-        okrugs = config["filters"].get("okrugs", [])
+        okrugs = filters.get("okrugs", [])
         if o in okrugs:
             okrugs.remove(o)
         else:
             okrugs.append(o)
-        config["filters"]["okrugs"] = okrugs
-        save_json(CONFIG_PATH, config)
+        filters["okrugs"] = okrugs
+        save_users()
 
     elif data == "freset":
-        config["filters"]["price_ranges"] = []
-        config["filters"]["property_types"] = []
-        config["filters"]["okrugs"] = []
-        save_json(CONFIG_PATH, config)
+        filters["price_ranges"] = []
+        filters["property_types"] = []
+        filters["okrugs"] = []
+        save_users()
 
     elif data == "fapply":
         # выбор галочек сам по себе поиск не запускает — только явное
@@ -2435,23 +2545,23 @@ def handle_callback_query(cq):
         # если бюджет/тип жилья/округ реально поменялись с тех пор, сообщаем
         # об этом явно, а не молча запускаем скан
         current_snapshot = {
-            "price_ranges": [list(r) for r in config["filters"].get("price_ranges", [])],
-            "property_types": list(config["filters"].get("property_types", [])),
-            "okrugs": list(config["filters"].get("okrugs", [])),
+            "price_ranges": [list(r) for r in filters.get("price_ranges", [])],
+            "property_types": list(filters.get("property_types", [])),
+            "okrugs": list(filters.get("okrugs", [])),
         }
-        if current_snapshot != state.get("last_applied_filters"):
+        if current_snapshot != state.get("users", {}).get(chat_id, {}).get("last_applied_filters"):
             filter_changed = True
-            save_state(last_applied_filters=current_snapshot)
+            _save_user_last_applied_filters(chat_id, current_snapshot)
 
     answer_callback_query(cq["id"])
     if message.get("message_id"):
-        edit_message_reply_markup(chat_id, message["message_id"], build_filters_keyboard())
+        edit_message_reply_markup(chat_id, message["message_id"], build_filters_keyboard(chat_id))
 
     if filter_changed:
-        send_telegram_message("Новые фильтры применены")
+        send_telegram_message(chat_id, "Новые фильтры применены")
 
     if apply_requested:
-        _schedule_recent_scan(delay=0.5)
+        _schedule_recent_scan(chat_id, delay=0.5)
 
 
 # ==================== КОМАНДЫ ИЗ TELEGRAM ====================
@@ -2466,14 +2576,17 @@ HELP_TEXT = (
     "/districts район1,район2 — районы (0 — сбросить, любой район)\n"
     "/keywords слово1,слово2 — ключевые слова (полностью заменяют текущие)\n"
     "/exclude слово1,слово2 — слова-исключения (полностью заменяют текущие)\n"
-    "/addchannel имя_канала — добавить канал\n"
-    "/removechannel имя_канала — убрать канал\n"
-    "/channels — показать список каналов\n"
     "/filters — показать текущие фильтры\n"
     f"{FILTERS_MENU_BUTTON} (кнопка снизу) — настроить бюджет и тип жилья тапами\n"
     f"{FILTERS_RESET_BUTTON} (кнопка снизу) — сбросить бюджет и тип жилья\n"
-    "/help — это сообщение"
+    "/help — это сообщение\n\n"
+    "Список каналов, которые бот сканирует, общий для всех и настраивается владельцем."
 )
+
+# управление списком каналов — общая инфраструктура (одни и те же каналы
+# сканируются для всех пользователей), а не персональная настройка, поэтому
+# доступно только владельцу бота
+OWNER_ONLY_TEXT = "Эта команда доступна только владельцу бота."
 
 
 def get_telegram_updates(poll_timeout=0):
@@ -2492,17 +2605,21 @@ def get_telegram_updates(poll_timeout=0):
         return []
 
 
-def handle_command(text):
+def handle_command(text, chat_id):
+    chat_id = str(chat_id)
+    is_owner = bool(MY_CHAT_ID) and chat_id == str(MY_CHAT_ID)
+
     if text.strip() == FILTERS_MENU_BUTTON:
-        show_filters_menu()
+        show_filters_menu(chat_id)
         return
 
     if text.strip() == FILTERS_RESET_BUTTON:
-        config["filters"]["price_ranges"] = []
-        config["filters"]["property_types"] = []
-        config["filters"]["okrugs"] = []
-        save_json(CONFIG_PATH, config)
-        send_telegram_message("Бюджет, тип жилья и округ сброшены.")
+        filters = get_user_filters(chat_id)
+        filters["price_ranges"] = []
+        filters["property_types"] = []
+        filters["okrugs"] = []
+        save_users()
+        send_telegram_message(chat_id, "Бюджет, тип жилья и округ сброшены.")
         return
 
     parts = text.strip().split(maxsplit=1)
@@ -2516,6 +2633,7 @@ def handle_command(text):
         # клавиатура (⚙️ Настроить/Сбросить фильтры) намеренно не
         # показывается здесь — появится только после прохождения мастера
         send_telegram_message(
+            chat_id,
             "Привет! 👋 Давай настроим тебе фильтры.",
             reply_markup={
                 "inline_keyboard": [[{"text": "Настроить фильтры", "callback_data": "wizard_start"}]]
@@ -2524,113 +2642,124 @@ def handle_command(text):
         return
 
     if cmd == "/help":
-        send_telegram_message(HELP_TEXT, reply_markup=MAIN_REPLY_KEYBOARD)
+        send_telegram_message(chat_id, HELP_TEXT, reply_markup=MAIN_REPLY_KEYBOARD)
         return
 
     if cmd == "/menu":
-        show_filters_menu()
+        show_filters_menu(chat_id)
         return
+
+    filters = get_user_filters(chat_id)
 
     if cmd == "/price":
         nums = arg.split()
         if len(nums) != 2 or not all(n.isdigit() for n in nums):
-            send_telegram_message("Формат: /price мин макс, например /price 0 50000")
+            send_telegram_message(chat_id, "Формат: /price мин макс, например /price 0 50000")
             return
-        config["filters"]["price_min"] = int(nums[0])
-        config["filters"]["price_max"] = int(nums[1])
-        save_json(CONFIG_PATH, config)
-        send_telegram_message(f"Готово: цена от {nums[0]} до {nums[1]} руб")
+        filters["price_min"] = int(nums[0])
+        filters["price_max"] = int(nums[1])
+        save_users()
+        send_telegram_message(chat_id, f"Готово: цена от {nums[0]} до {nums[1]} руб")
         return
 
     if cmd == "/metro":
         if not arg.isdigit():
-            send_telegram_message("Формат: /metro минуты, например /metro 20")
+            send_telegram_message(chat_id, "Формат: /metro минуты, например /metro 20")
             return
-        config["filters"]["metro_max_minutes"] = int(arg)
-        save_json(CONFIG_PATH, config)
-        send_telegram_message(f"Готово: метро до {arg} мин. пешком")
+        filters["metro_max_minutes"] = int(arg)
+        save_users()
+        send_telegram_message(chat_id, f"Готово: метро до {arg} мин. пешком")
         return
 
     if cmd == "/rooms":
         if arg.strip() == "0":
-            config["filters"]["rooms"] = []
-            save_json(CONFIG_PATH, config)
-            send_telegram_message("Готово: фильтр по числу комнат сброшен (подходит любое)")
+            filters["rooms"] = []
+            save_users()
+            send_telegram_message(chat_id, "Готово: фильтр по числу комнат сброшен (подходит любое)")
             return
         nums = [n.strip() for n in arg.split(",") if n.strip()]
         if not nums or not all(n.isdigit() for n in nums):
-            send_telegram_message("Формат: /rooms 1,2 (или /rooms 0, чтобы сбросить)")
+            send_telegram_message(chat_id, "Формат: /rooms 1,2 (или /rooms 0, чтобы сбросить)")
             return
-        config["filters"]["rooms"] = [int(n) for n in nums]
-        save_json(CONFIG_PATH, config)
-        send_telegram_message("Готово: подходящее число комнат — " + ", ".join(nums))
+        filters["rooms"] = [int(n) for n in nums]
+        save_users()
+        send_telegram_message(chat_id, "Готово: подходящее число комнат — " + ", ".join(nums))
         return
 
     if cmd == "/districts":
         if arg.strip() == "0":
-            config["filters"]["districts"] = []
-            save_json(CONFIG_PATH, config)
-            send_telegram_message("Готово: фильтр по районам сброшен (подходит любой)")
+            filters["districts"] = []
+            save_users()
+            send_telegram_message(chat_id, "Готово: фильтр по районам сброшен (подходит любой)")
             return
         if not arg:
-            send_telegram_message("Формат: /districts район1,район2 (или /districts 0, чтобы сбросить)")
+            send_telegram_message(chat_id, "Формат: /districts район1,район2 (или /districts 0, чтобы сбросить)")
             return
         districts = [d.strip() for d in arg.split(",") if d.strip()]
-        config["filters"]["districts"] = districts
-        save_json(CONFIG_PATH, config)
-        send_telegram_message("Готово: районы — " + ", ".join(districts))
+        filters["districts"] = districts
+        save_users()
+        send_telegram_message(chat_id, "Готово: районы — " + ", ".join(districts))
         return
 
     if cmd == "/keywords":
         if not arg:
-            send_telegram_message("Формат: /keywords слово1,слово2,...")
+            send_telegram_message(chat_id, "Формат: /keywords слово1,слово2,...")
             return
         words = [w.strip() for w in arg.split(",") if w.strip()]
-        config["filters"]["keywords_include"] = words
-        save_json(CONFIG_PATH, config)
-        send_telegram_message("Готово: ключевые слова — " + ", ".join(words))
+        filters["keywords_include"] = words
+        save_users()
+        send_telegram_message(chat_id, "Готово: ключевые слова — " + ", ".join(words))
         return
 
     if cmd == "/exclude":
         if not arg:
-            send_telegram_message("Формат: /exclude слово1,слово2,...")
+            send_telegram_message(chat_id, "Формат: /exclude слово1,слово2,...")
             return
         words = [w.strip() for w in arg.split(",") if w.strip()]
-        config["filters"]["keywords_exclude"] = words
-        save_json(CONFIG_PATH, config)
-        send_telegram_message("Готово: слова-исключения — " + ", ".join(words))
+        filters["keywords_exclude"] = words
+        save_users()
+        send_telegram_message(chat_id, "Готово: слова-исключения — " + ", ".join(words))
         return
 
     if cmd == "/addchannel":
+        if not is_owner:
+            send_telegram_message(chat_id, OWNER_ONLY_TEXT)
+            return
         if not arg:
-            send_telegram_message("Формат: /addchannel имя_канала")
+            send_telegram_message(chat_id, "Формат: /addchannel имя_канала")
             return
         channel = arg.lstrip("@").strip()
         if channel not in config["channels"]:
             config["channels"].append(channel)
             save_json(CONFIG_PATH, config)
-        send_telegram_message(f"Готово: канал {channel} добавлен")
+        send_telegram_message(chat_id, f"Готово: канал {channel} добавлен")
         return
 
     if cmd == "/removechannel":
+        if not is_owner:
+            send_telegram_message(chat_id, OWNER_ONLY_TEXT)
+            return
         if not arg:
-            send_telegram_message("Формат: /removechannel имя_канала")
+            send_telegram_message(chat_id, "Формат: /removechannel имя_канала")
             return
         channel = arg.lstrip("@").strip()
         if channel in config["channels"]:
             config["channels"].remove(channel)
             save_json(CONFIG_PATH, config)
-            send_telegram_message(f"Готово: канал {channel} убран")
+            send_telegram_message(chat_id, f"Готово: канал {channel} убран")
         else:
-            send_telegram_message(f"Канал {channel} не найден в списке")
+            send_telegram_message(chat_id, f"Канал {channel} не найден в списке")
         return
 
     if cmd == "/channels":
-        send_telegram_message("Текущие каналы:\n" + "\n".join(config["channels"]))
+        if not is_owner:
+            send_telegram_message(chat_id, OWNER_ONLY_TEXT)
+            return
+        send_telegram_message(chat_id, "Текущие каналы:\n" + "\n".join(config["channels"]))
         return
 
     if cmd == "/filters":
-        f = config["filters"]
+        f = filters
         if f.get("price_ranges"):
             price_line = ", ".join(_budget_label(lo, hi) for lo, hi in f["price_ranges"])
         else:
@@ -2644,10 +2773,10 @@ def handle_command(text):
             f"Цена: {price_line}\n"
             f"Тип жилья: {types_line}\n"
             f"Округ: {okrugs_line}\n"
-            f"Метро: до {f.get('metro_max_minutes', '—')} мин. пешком\n"
+            f"Метро: до {f.get('metro_max_minutes') or '—'} мин. пешком\n"
             f"Районы: {', '.join(f['districts']) or 'любые'}"
         )
-        send_telegram_message(reply)
+        send_telegram_message(chat_id, reply)
         return
 
     # неизвестная команда/обычное сообщение не по теме — молча игнорируем
@@ -2663,8 +2792,7 @@ def handle_update(upd):
     if not msg:
         return
     chat_id = str(msg["chat"]["id"])
-    if chat_id != str(MY_CHAT_ID):
-        return  # игнорируем сообщения не из твоего чата
+    register_user(chat_id)
 
     # временный помощник: если прислали/переслали кастомный эмодзи (нужно
     # для веток метро) — сохраняем его custom_emoji_id в файл (раньше id
@@ -2716,7 +2844,7 @@ def handle_update(upd):
         reply = f"Сохранил {len(custom_emojis)} шт. в emoji_ids.log:\n" + "\n".join(lines)
         if label:
             reply += f"\nПодпись рядом: {label}"
-        send_telegram_message(reply)
+        send_telegram_message(chat_id, reply)
         return
 
     if "text" not in msg:
@@ -2724,7 +2852,7 @@ def handle_update(upd):
 
     text = msg["text"].strip()
     if text.startswith("/") or text in (FILTERS_MENU_BUTTON, FILTERS_RESET_BUTTON):
-        handle_command(text)
+        handle_command(text, chat_id)
 
 
 def _process_update_batch(updates):
@@ -2879,8 +3007,8 @@ def main():
     if "--commands-only" in sys.argv:
         process_commands()
         return
-    posts = fetch_new_posts(config["channels"], config["filters"])
-    send_digest(posts)
+    posts = fetch_new_posts(config["channels"])
+    dispatch_posts_to_users(posts)
 
 
 if __name__ == "__main__":

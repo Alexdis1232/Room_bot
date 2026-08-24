@@ -660,8 +660,8 @@ def test_start_sends_short_intro_with_wizard_button_not_help_text(monkeypatch):
     # первый запуск теперь короткий: без фото и без длинного текста —
     # только приглашение с кнопкой, запускающей пошаговый мастер
     calls = []
-    monkeypatch.setattr(rb, "send_telegram_message", lambda text, **kw: calls.append((text, kw)))
-    rb.handle_command("/start")
+    monkeypatch.setattr(rb, "send_telegram_message", lambda chat_id, text, **kw: calls.append((text, kw)))
+    rb.handle_command("/start", "111")
     assert len(calls) == 1
     text, kwargs = calls[0]
     assert text != rb.HELP_TEXT
@@ -674,25 +674,21 @@ def test_start_sends_short_intro_with_wizard_button_not_help_text(monkeypatch):
 
 def test_help_sends_full_command_list(monkeypatch):
     sent = []
-    monkeypatch.setattr(rb, "send_telegram_message", lambda text, **kw: sent.append(text))
-    rb.handle_command("/help")
+    monkeypatch.setattr(rb, "send_telegram_message", lambda chat_id, text, **kw: sent.append(text))
+    rb.handle_command("/help", "111")
     assert sent == [rb.HELP_TEXT]
 
 
 # ==================== МАСТЕР НАСТРОЙКИ (первый запуск) ====================
 
+WIZARD_CHAT_ID = "555"
+
+
 def _wizard_setup(monkeypatch, tmp_path):
-    config_path = tmp_path / "config.json"
-    fresh_config = {
-        "channels": [],
-        "filters": {
-            "keywords_include": [], "keywords_exclude": [], "districts": [],
-            "price_ranges": [], "property_types": [], "okrugs": [],
-            "price_min": 0, "price_max": 200000, "rooms": [], "metro_max_minutes": None,
-        },
-    }
-    monkeypatch.setattr(rb, "CONFIG_PATH", str(config_path))
-    monkeypatch.setattr(rb, "config", fresh_config)
+    users_path = tmp_path / "users.json"
+    monkeypatch.setattr(rb, "USERS_PATH", str(users_path))
+    monkeypatch.setattr(rb, "users", {})
+    monkeypatch.setattr(rb, "config", {"channels": []})
     monkeypatch.setattr(rb, "save_json", lambda path, data: None)
 
     calls = {"edit_text": [], "edit_markup": [], "sent": [], "answered": [], "scheduled": []}
@@ -704,64 +700,65 @@ def _wizard_setup(monkeypatch, tmp_path):
         rb, "edit_message_reply_markup",
         lambda chat_id, message_id, reply_markup: calls["edit_markup"].append(reply_markup),
     )
-    monkeypatch.setattr(rb, "send_telegram_message", lambda text, **kw: calls["sent"].append((text, kw)))
+    monkeypatch.setattr(rb, "send_telegram_message", lambda chat_id, text, **kw: calls["sent"].append((text, kw)))
     monkeypatch.setattr(rb, "answer_callback_query", lambda cq_id, text=None: calls["answered"].append(cq_id))
     monkeypatch.setattr(rb, "save_state", lambda **kw: None)
-    monkeypatch.setattr(rb, "_schedule_recent_scan", lambda delay=3.0: calls["scheduled"].append(delay))
+    monkeypatch.setattr(rb, "_save_user_last_applied_filters", lambda chat_id, snapshot: None)
+    monkeypatch.setattr(rb, "_schedule_recent_scan", lambda chat_id, delay=3.0: calls["scheduled"].append(delay))
     return calls
 
 
-def _cq(data, message_id=42):
+def _cq(data, message_id=42, chat_id=WIZARD_CHAT_ID):
     return {
         "id": "cbq1",
         "data": data,
-        "message": {"message_id": message_id, "chat": {"id": rb.MY_CHAT_ID}},
+        "message": {"message_id": message_id, "chat": {"id": chat_id}},
     }
 
 
 def test_wizard_start_shows_type_step(monkeypatch, tmp_path):
     calls = _wizard_setup(monkeypatch, tmp_path)
     rb.handle_callback_query(_cq("wizard_start"))
-    assert calls["edit_text"] == [(rb.WIZARD_TYPE_TEXT, rb.build_wizard_type_keyboard())]
+    assert calls["edit_text"] == [(rb.WIZARD_TYPE_TEXT, rb.build_wizard_type_keyboard(WIZARD_CHAT_ID))]
     assert calls["answered"] == ["cbq1"]
 
 
 def test_wizard_type_toggle_updates_filters_and_keyboard(monkeypatch, tmp_path):
     calls = _wizard_setup(monkeypatch, tmp_path)
     rb.handle_callback_query(_cq("wiz_t0"))
-    assert rb.PROPERTY_TYPE_OPTIONS[0] in rb.config["filters"]["property_types"]
-    assert calls["edit_markup"] == [rb.build_wizard_type_keyboard()]
+    assert rb.PROPERTY_TYPE_OPTIONS[0] in rb.get_user_filters(WIZARD_CHAT_ID)["property_types"]
+    assert calls["edit_markup"] == [rb.build_wizard_type_keyboard(WIZARD_CHAT_ID)]
 
     # повторное нажатие снимает галочку
     rb.handle_callback_query(_cq("wiz_t0"))
-    assert rb.PROPERTY_TYPE_OPTIONS[0] not in rb.config["filters"]["property_types"]
+    assert rb.PROPERTY_TYPE_OPTIONS[0] not in rb.get_user_filters(WIZARD_CHAT_ID)["property_types"]
 
 
 def test_wizard_next_type_shows_price_step(monkeypatch, tmp_path):
     calls = _wizard_setup(monkeypatch, tmp_path)
     rb.handle_callback_query(_cq("wiz_next_type"))
-    assert calls["edit_text"] == [(rb.WIZARD_PRICE_TEXT, rb.build_wizard_price_keyboard())]
+    assert calls["edit_text"] == [(rb.WIZARD_PRICE_TEXT, rb.build_wizard_price_keyboard(WIZARD_CHAT_ID))]
 
 
 def test_wizard_price_toggle_updates_filters(monkeypatch, tmp_path):
     calls = _wizard_setup(monkeypatch, tmp_path)
     rb.handle_callback_query(_cq("wiz_b0"))
     lo, hi = rb.BUDGET_BRACKETS[0]
-    assert [lo, hi] in rb.config["filters"]["price_ranges"]
-    assert calls["edit_markup"] == [rb.build_wizard_price_keyboard()]
+    assert [lo, hi] in rb.get_user_filters(WIZARD_CHAT_ID)["price_ranges"]
+    assert calls["edit_markup"] == [rb.build_wizard_price_keyboard(WIZARD_CHAT_ID)]
 
 
 def test_wizard_next_price_shows_okrug_step(monkeypatch, tmp_path):
     calls = _wizard_setup(monkeypatch, tmp_path)
     rb.handle_callback_query(_cq("wiz_next_price"))
-    assert calls["edit_text"] == [(rb.WIZARD_OKRUG_TEXT, rb.build_wizard_okrug_keyboard())]
+    assert calls["edit_text"] == [(rb.WIZARD_OKRUG_TEXT, rb.build_wizard_okrug_keyboard(WIZARD_CHAT_ID))]
 
 
 def test_wizard_okrug_toggle_updates_filters(monkeypatch, tmp_path):
     calls = _wizard_setup(monkeypatch, tmp_path)
     rb.handle_callback_query(_cq("wiz_o0"))
-    assert rb.OKRUG_OPTIONS[0] in rb.config["filters"]["okrugs"]
-    assert calls["edit_markup"] == [rb.build_wizard_okrug_keyboard()]
+    assert rb.OKRUG_OPTIONS[0] in rb.get_user_filters(WIZARD_CHAT_ID)["okrugs"]
+    assert calls["edit_markup"] == [rb.build_wizard_okrug_keyboard(WIZARD_CHAT_ID)]
 
 
 def test_wizard_finish_reveals_bottom_keyboard_and_schedules_scan(monkeypatch, tmp_path):
@@ -781,6 +778,23 @@ def test_wizard_finish_reveals_bottom_keyboard_and_schedules_scan(monkeypatch, t
     assert calls["scheduled"] == [0.5]
 
 
+def test_two_users_wizards_do_not_interfere(monkeypatch, tmp_path):
+    # это и есть суть многопользовательского режима: у каждого свои
+    # фильтры, действия одного не должны трогать выбор другого
+    calls = _wizard_setup(monkeypatch, tmp_path)
+    alice, bob = "111", "222"
+
+    rb.handle_callback_query(_cq("wiz_t0", chat_id=alice))
+    rb.handle_callback_query(_cq("wiz_t1", chat_id=bob))
+
+    alice_types = rb.get_user_filters(alice)["property_types"]
+    bob_types = rb.get_user_filters(bob)["property_types"]
+    assert rb.PROPERTY_TYPE_OPTIONS[0] in alice_types
+    assert rb.PROPERTY_TYPE_OPTIONS[0] not in bob_types
+    assert rb.PROPERTY_TYPE_OPTIONS[1] in bob_types
+    assert rb.PROPERTY_TYPE_OPTIONS[1] not in alice_types
+
+
 def test_digest_reattaches_reply_keyboard_to_photoless_post(monkeypatch, tmp_path):
     # пользователь может случайно свернуть постоянную клавиатуру снизу
     # (⚙️ Настроить фильтры / Сбросить фильтры) — она должна сама
@@ -794,13 +808,13 @@ def test_digest_reattaches_reply_keyboard_to_photoless_post(monkeypatch, tmp_pat
     calls = []
     monkeypatch.setattr(
         rb, "send_telegram_message",
-        lambda text, **kw: calls.append(kw.get("reply_markup")) or {"message_id": 1},
+        lambda chat_id, text, **kw: calls.append(kw.get("reply_markup")) or {"message_id": 1},
     )
 
     post = {
         "id": 1, "channel": "chanA", "date": "", "datetime": None,
         "text": "1-к квартира, 55000 руб", "link": "https://t.me/chanA/1", "photos": [],
     }
-    rb.send_digest([post])
+    rb.send_digest("42", [post])
 
     assert calls == [rb.MAIN_REPLY_KEYBOARD]

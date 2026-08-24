@@ -158,7 +158,7 @@ def test_send_telegram_photo_file_reads_local_bytes(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(rb, "_telegram_api", lambda method, **kw: calls.append((method, kw)) or {"ok": True})
 
-    ok = rb.send_telegram_photo_file(str(image_path), caption="подпись")
+    ok = rb.send_telegram_photo_file("42", str(image_path), caption="подпись")
     assert ok is True
     method, kw = calls[0]
     assert method == "sendPhoto"
