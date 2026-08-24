@@ -72,6 +72,55 @@ def test_price_after_stoimost_keyword():
     assert rb.extract_price("Стоимость 45к, все включено") == 45000
 
 
+def test_price_with_comma_as_thousands_separator():
+    # "27,500" — запятая как разделитель тысяч, не десятичная запятая
+    # (после неё ровно 3 цифры, а не дробная часть)
+    assert rb.extract_price("Условия: аренда комнаты 27,500 + счетчики") == 27500
+
+
+def test_price_bare_five_or_six_digit_number_without_any_keyword():
+    # совсем без слова-подсказки рядом ("цена"/"оплата"/"условия") — просто
+    # голое 5-6-значное число само по себе, реальная цена почти всегда в
+    # этом диапазоне (10 000–999 999 руб)
+    assert rb.extract_price("Сдам уютную комнату, всё включено. 45000. Звоните.") == 45000
+    assert rb.extract_price("Светлая квартира рядом с парком. 125000 ежемесячно.") == 125000
+    # но не 4-значные и не 7+-значные числа
+    assert rb.extract_price("Дом 1985 года постройки, ремонт свежий") is None
+    # и не площадь/год рядом
+    assert rb.extract_price("Площадь 45000 кв.м, ремонт свежий") is None
+    assert rb.extract_price("Сдам с 2026 года, ремонт свежий") is None
+    # и не число внутри телефона
+    assert rb.extract_price("Звоните 89161234567, обсудим детали") is None
+
+
+def test_phone_number_becomes_clickable_tel_link():
+    post = {
+        "text": "Сдам квартиру 55000 руб. Звоните +7 916 123 45 67",
+        "link": "https://t.me/test/1",
+    }
+    message = rb.format_post_message(post)
+    assert '<a href="tel:+79161234567">+7 916 123 45 67</a>' in message
+
+
+def test_local_phone_number_without_country_code_gets_plus7():
+    post = {
+        "text": "Сдам квартиру 55000 руб. Звоните 8 916 123 45 67",
+        "link": "https://t.me/test/2",
+    }
+    message = rb.format_post_message(post)
+    assert '<a href="tel:+79161234567">8 916 123 45 67</a>' in message
+
+
+def test_telegram_username_contact_is_not_linkified_as_phone():
+    post = {
+        "text": "Сдам квартиру 55000 руб. Контакт: @ivanov",
+        "link": "https://t.me/test/3",
+    }
+    message = rb.format_post_message(post)
+    assert 'href="tel:' not in message
+    assert "@ivanov" in message
+
+
 def test_price_shorthand_prepositional_case():
     # "По цене: 28к" — раньше не ловилось: искали только "цена" в
     # именительном падеже, а тут предложный ("цене")

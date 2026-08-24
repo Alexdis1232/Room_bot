@@ -164,11 +164,14 @@ state = load_json(STATE_PATH, {"last_ids": {}})
 
 # ==================== ФИЛЬТРАЦИЯ ====================
 
-# число либо сгруппировано по 3 цифры через пробел/точку ("55.000", "45 000"),
-# либо идёт слитно без разделителей ("40000"); НЕ допускаем произвольные
-# пробелы/точки внутри цифр без строгой группировки — иначе regex может
-# "перескочить" через границу предложения и склеить номер дома с ценой
-_PRICE_NUM = r"(?:\d{1,3}(?:[ .]\d{3})+|\d{3,9})"
+# число либо сгруппировано по 3 цифры через пробел/точку/запятую ("55.000",
+# "45 000", "27,500"), либо идёт слитно без разделителей ("40000"); НЕ
+# допускаем произвольные разделители внутри цифр без строгой группировки —
+# иначе regex может "перескочить" через границу предложения и склеить номер
+# дома с ценой. Запятая — не опечатка, а обычный для таких объявлений
+# разделитель тысяч (не путать с десятичной запятой — той всегда следует
+# меньше 3 цифр, "3,5", и она сюда не попадает благодаря {3} ровно)
+_PRICE_NUM = r"(?:\d{1,3}(?:[ .,]\d{3})+|\d{3,9})"
 PRICE_RE = re.compile(r"(" + _PRICE_NUM + r")\s?(?:руб|₽|р\.)", re.IGNORECASE)
 # "цена"/"оплата"/"плата" по всем падежам ("по цене", "оплату", "платы"), а
 # не только именительный — раньше "По цене: 28к" не ловилось, потому что
@@ -208,6 +211,17 @@ PRICE_SHORTHAND_RE = re.compile(
 # сокращение числа комнат ("2к квартира"/"3к"), там всегда одна цифра и его
 # уже отдельно ловит ROOMS_RE
 PRICE_BARE_SHORTHAND_RE = re.compile(r"(?<!\d)(\d{2,3})\s?к\b(?!\w)", re.IGNORECASE)
+# самый последний, самый широкий запасной вариант — "голое" число без
+# вообще какого-либо текстового намёка рядом (ни знака валюты, ни слова
+# "цена"/"оплата"/"условия", ничего). Годится только потому, что реальная
+# цена комнаты/квартиры в Москве почти всегда укладывается в 10 000–999 999
+# (5-6 цифр) — при таком диапазоне значений это достаточно надёжный сигнал
+# сам по себе. Отсекаем явно не-ценовой контекст рядом (площадь, год)
+PRICE_BARE_FULL_RE = re.compile(
+    r"(?<!\d)(" + _PRICE_NUM + r")(?!\d)"
+    r"(?!\s?(?:кв\.?\s?м\w*|м²|м\^?2|год\w*|г\.))",
+    re.IGNORECASE,
+)
 DEPOSIT_RE = re.compile(r"залог\w*|депозит\w*", re.IGNORECASE)
 COMMISSION_RE = re.compile(r"комисси\w*", re.IGNORECASE)
 # отдельные мелкие ежемесячные платежи (интернет и т.п.) со своим "руб/₽"
@@ -270,8 +284,8 @@ def _normalize_transport_mode(mode):
 
 
 def _price_to_int(raw):
-    # убираем пробелы и точки-разделители тысяч ("55.000" -> "55000")
-    cleaned = re.sub(r"[\s.]", "", raw)
+    # убираем пробелы, точки и запятые-разделители тысяч ("55.000"/"27,500" -> "55000"/"27500")
+    cleaned = re.sub(r"[\s.,]", "", raw)
     try:
         return int(cleaned)
     except ValueError:
@@ -423,6 +437,13 @@ def extract_price(text):
         val = _price_to_int(m.group(1))
         if val is not None:
             return val * 1000
+
+    for m in PRICE_BARE_FULL_RE.finditer(text):
+        if _span_overlaps_any(m.span(1), exclude_spans):
+            continue
+        val = _price_to_int(m.group(1))
+        if val is not None and 10000 <= val <= 999999:
+            return val
 
     return None
 
@@ -1231,6 +1252,40 @@ def extract_address(text):
     return street or zhk
 
 
+# то же, что телефонная альтернатива в CONTACT_RE — используется отдельно,
+# чтобы отличить номер телефона от остальных контактов (юзернейм/ссылка) и
+# сделать из него кликабельную tel:-ссылку в самом сообщении
+_PHONE_TOKEN_RE = re.compile(r"^\+?\d[\d\-() \t]{6,}\d$")
+
+
+def _phone_tel_href(raw_phone):
+    digits = re.sub(r"[^\d+]", "", raw_phone)
+    if digits.startswith("+"):
+        return digits
+    if digits.startswith("8") and len(digits) == 11:
+        return "+7" + digits[1:]
+    if len(digits) == 10:
+        return "+7" + digits
+    return "+" + digits
+
+
+def format_contacts_html(contacts, escape):
+    # контакты — одна строка через ", " (см. extract_contacts); номера
+    # телефонов внутри неё оборачиваем в <a href="tel:...">, чтобы по ним
+    # можно было тапнуть и сразу открыть набор номера — юзернеймы/ссылки
+    # оставляем как обычный текст (в Telegram они и так кликабельны сами)
+    if not contacts:
+        return "не указаны"
+    parts = []
+    for raw in contacts.split(", "):
+        if _PHONE_TOKEN_RE.match(raw.strip()):
+            href = _phone_tel_href(raw.strip())
+            parts.append(f'<a href="tel:{href}">{escape(raw)}</a>')
+        else:
+            parts.append(escape(raw))
+    return ", ".join(parts)
+
+
 def extract_contacts(text):
     matches = CONTACT_RE.findall(text) + [f"@{h}" for h in TG_HANDLE_RE.findall(text)]
     seen = set()
@@ -1856,7 +1911,7 @@ def format_post_message(p):
         blocks.append(f"Инфраструктура:\nРядом {e(', '.join(capitalized))}")
 
     blocks += [
-        f"📞 Контакты: {e(contacts or 'не указаны')}",
+        f"📞 Контакты: {format_contacts_html(contacts, e)}",
         f"🔗 Подробнее: {e(p['link'])}",
         SCAM_WARNING_HTML,
     ]
