@@ -2443,12 +2443,6 @@ def handle_callback_query(cq):
                 "Поменять фильтры можно в любой момент кнопкой ⚙️ снизу.",
             )
         send_telegram_message("Кнопки для дальнейшей настройки — снизу.", reply_markup=MAIN_REPLY_KEYBOARD)
-        current_snapshot = {
-            "price_ranges": [list(r) for r in config["filters"].get("price_ranges", [])],
-            "property_types": list(config["filters"].get("property_types", [])),
-            "okrugs": list(config["filters"].get("okrugs", [])),
-        }
-        save_state(last_applied_filters=current_snapshot)
         _schedule_recent_scan(delay=0.5)
         return
 
@@ -2496,17 +2490,7 @@ def handle_callback_query(cq):
         # нажатие этой кнопки, чтобы не сканировать каналы раньше времени,
         # пока пользователь ещё отмечает варианты
         apply_requested = True
-        # сравниваем с тем, что было применено в прошлый раз "Применить" —
-        # если бюджет/тип жилья/округ реально поменялись с тех пор, сообщаем
-        # об этом явно, а не молча запускаем скан
-        current_snapshot = {
-            "price_ranges": [list(r) for r in config["filters"].get("price_ranges", [])],
-            "property_types": list(config["filters"].get("property_types", [])),
-            "okrugs": list(config["filters"].get("okrugs", [])),
-        }
-        if current_snapshot != state.get("last_applied_filters"):
-            filter_changed = True
-            save_state(last_applied_filters=current_snapshot)
+        filter_changed = True
 
     answer_callback_query(cq["id"])
     if message.get("message_id"):
