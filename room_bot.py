@@ -2497,7 +2497,7 @@ def handle_callback_query(cq):
         edit_message_reply_markup(chat_id, message["message_id"], build_filters_keyboard())
 
     if filter_changed:
-        send_telegram_message("Новые фильтры применены")
+        send_telegram_message("Фильтры применены. Ожидайте новые объявления")
 
     if apply_requested:
         _schedule_recent_scan(delay=0.5)
