@@ -707,7 +707,7 @@ def _wizard_setup(monkeypatch, tmp_path):
     monkeypatch.setattr(rb, "send_telegram_message", lambda text, **kw: calls["sent"].append((text, kw)))
     monkeypatch.setattr(rb, "answer_callback_query", lambda cq_id, text=None: calls["answered"].append(cq_id))
     monkeypatch.setattr(rb, "save_state", lambda **kw: None)
-    monkeypatch.setattr(rb, "_schedule_recent_scan", lambda delay=3.0: calls["scheduled"].append(delay))
+    monkeypatch.setattr(rb, "_schedule_recent_scan", lambda delay=3.0, chat_id=None: calls["scheduled"].append(delay))
     return calls
 
 

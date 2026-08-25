@@ -44,12 +44,12 @@ class _DigestRecorder:
     def send_message(self, text, **kwargs):
         self.messages.append(text)
 
-    def send_digest(self, posts):
+    def send_digest(self, posts, chat_id=None):
         self.digests.append([p["id"] for p in posts])
         # реальная send_digest помечает посты отправленными сама (см.
         # _mark_as_sent) — заглушка должна делать то же самое, иначе тесты
         # проверяли бы не то поведение, что действительно есть в коде
-        rb._mark_as_sent(posts)
+        rb._mark_as_sent(posts, chat_id=chat_id)
 
 
 def setup_isolated_state(monkeypatch, tmp_path):

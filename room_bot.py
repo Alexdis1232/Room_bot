@@ -194,6 +194,85 @@ def save_state(**changed):
     return _update_state_locked(lambda fresh: fresh.update(changed))
 
 
+def _mongo_update_locked(doc_id, default, update_fn):
+    # обобщённая версия _update_state_locked для ЛЮБОГО mongo-документа
+    # (не только "state") — читает свежим, даёт update_fn изменить его на
+    # месте, сохраняет, всё под одной блокировкой. Используется для личных
+    # документов пользователей ("user:<chat_id>") и списка зарегистрированных
+    # чатов ("users")
+    with _state_update_lock:
+        doc = _mongo_collection().find_one({"_id": doc_id})
+        fresh = copy.deepcopy(default) if doc is None else doc
+        fresh.pop("_id", None)
+        update_fn(fresh)
+        to_save = dict(fresh)
+        to_save["_id"] = doc_id
+        _mongo_collection().replace_one({"_id": doc_id}, to_save, upsert=True)
+        return fresh
+
+
+def _user_doc_default(chat_id):
+    return {"chat_id": chat_id, "filters": copy.deepcopy(DEFAULT_FILTERS), "sent_post_ids": []}
+
+
+def _load_user_filters(chat_id):
+    doc = _mongo_collection().find_one({"_id": f"user:{chat_id}"})
+    if doc and doc.get("filters"):
+        return doc["filters"]
+    return copy.deepcopy(DEFAULT_FILTERS)
+
+
+def _ensure_user_registered(chat_id):
+    # добавляет chat_id в общий индекс зарегистрированных пользователей
+    # (документ "users"), если его там ещё нет; возвращает True, если
+    # пользователь оказался НОВЫМ — тогда handle_update показывает ему
+    # приветствие/мастер настройки вместо того, что он реально прислал
+    result = {"is_new": False}
+
+    def _apply(fresh):
+        chat_ids = fresh.setdefault("chat_ids", [])
+        if chat_id not in chat_ids:
+            chat_ids.append(chat_id)
+            result["is_new"] = True
+
+    _mongo_update_locked("users", {"chat_ids": []}, _apply)
+    return result["is_new"]
+
+
+def _all_registered_chat_ids():
+    doc = _mongo_collection().find_one({"_id": "users"})
+    return list((doc or {}).get("chat_ids", []))
+
+
+def save_filters():
+    # сохраняет ТЕКУЩЕЕ значение config["filters"]. В mongo-режиме это
+    # фильтры активного в данный момент пользователя (_active_chat_id,
+    # см. _run_for_user) — уходят в его личный документ, а не в общий
+    # "config", чтобы не путать фильтры разных людей. В файловом режиме
+    # (Windows/VM, один пользователь) — как и раньше, весь config целиком
+    if STORAGE_BACKEND == "mongo" and _active_chat_id is not None:
+        chat_id = _active_chat_id
+
+        def _apply(fresh):
+            fresh["filters"] = config["filters"]
+            fresh.setdefault("chat_id", chat_id)
+            fresh.setdefault("sent_post_ids", [])
+
+        _mongo_update_locked(f"user:{chat_id}", _user_doc_default(chat_id), _apply)
+        return
+    save_json(CONFIG_PATH, config)
+
+
+def save_channels():
+    # список каналов общий на всех — отдельная функция от save_filters,
+    # чтобы правка каналов одним человеком не задевала личные фильтры
+    # другого и наоборот (оба раньше шли через один save_json(CONFIG_PATH,...))
+    if STORAGE_BACKEND == "mongo":
+        _mongo_collection().update_one({"_id": "config"}, {"$set": {"channels": config["channels"]}}, upsert=True)
+        return
+    save_json(CONFIG_PATH, config)
+
+
 DEFAULT_CONFIG = {
     "channels": [
         "example_channel_1",
@@ -212,6 +291,24 @@ DEFAULT_CONFIG = {
         "metro_max_minutes": 15
     }
 }
+# то же самое, отдельной константой — в mongo-режиме (многопользовательский
+# бот) фильтры больше не часть общего config, а личные для каждого чата
+# (см. _load_user_filters), DEFAULT_CONFIG["filters"] тут не подходит, т.к.
+# используется только для однопользовательского файлового режима
+DEFAULT_FILTERS = copy.deepcopy(DEFAULT_CONFIG["filters"])
+
+# в mongo-режиме сообщение может прийти от ЛЮБОГО пользователя — весь код
+# ниже (handle_command/handle_callback_query и всё, что они вызывают)
+# написан в расчёте на единственный чат и читает/пишет глобальные config["filters"]
+# и шлёт в MY_CHAT_ID по умолчанию. Чтобы не переписывать десятки мест,
+# _run_for_user (см. ниже) на время обработки ОДНОГО апдейта подставляет в
+# config["filters"] фильтры именно этого пользователя и запоминает его
+# chat_id здесь — send_telegram_message и т.п. используют его как адресата,
+# если явный chat_id не передан. _multiuser_lock сериализует обработку
+# апдейтов между потоками gunicorn, чтобы два пользователя не наступили друг
+# другу на этот общий "текущий" контекст одновременно
+_active_chat_id = None
+_multiuser_lock = threading.Lock()
 
 config = load_json(CONFIG_PATH, DEFAULT_CONFIG)
 if not os.path.exists(CONFIG_PATH):
@@ -1721,11 +1818,11 @@ def fetch_channel_posts_since(channel, cutoff_dt, max_pages=15):
     return _merge_price_continuation_posts(all_posts)
 
 
-_pending_scan_timer = None
+_pending_scan_timers = {}  # chat_id (или None в файловом режиме) -> Timer
 _scan_lock = threading.Lock()
 
 
-def _run_recent_scan(channels, filters):
+def _run_recent_scan(channels, filters, chat_id=None):
     # запускается таймером в отдельном потоке (см. _schedule_recent_scan) —
     # необработанное исключение здесь НЕ попадёт ни в try/except вокруг
     # main() (он ловит только свой, главный поток), ни в лог: threading
@@ -1735,36 +1832,42 @@ def _run_recent_scan(channels, filters):
     # "Применить" (например, сеть отвалилась на середине) означала полную
     # тишину: ни сообщения с результатом, ни следа в bot.log
     try:
-        send_recent_matching_ads(channels=channels, filters=filters)
+        send_recent_matching_ads(channels=channels, filters=filters, chat_id=chat_id)
     except Exception as e:
         log(f"Ошибка при скане по кнопке 'Применить': {e}")
-        send_telegram_message(f"Не удалось выполнить поиск по фильтру: {e}")
+        send_telegram_message(f"Не удалось выполнить поиск по фильтру: {e}", chat_id=chat_id)
 
 
-def _schedule_recent_scan(delay=3.0):
+def _schedule_recent_scan(delay=3.0, chat_id=None):
     # сканирование каналов может занять много времени (постраничная
     # подгрузка истории), поэтому запускаем в фоновом потоке — иначе
     # слушатель не сможет обработать следующие нажатия/команды, пока
     # скан не закончится. Debounce: несколько нажатий подряд (например,
     # отметили сразу 3 галочки) откладывают запуск, а не плодят по скану
     # на каждое нажатие — сработает только последний, спустя `delay` сек
-    # тишины
-    global _pending_scan_timer
+    # тишины. В mongo-режиме таймер отдельный НА КАЖДОГО пользователя (ключ
+    # словаря — chat_id) — иначе повторное нажатие "Применить" одним
+    # человеком отменяло бы ещё не сработавший скан другого
     # снимок фильтров/каналов делаем СЕЙЧАС, в вызывающем потоке — иначе
     # фоновый таймер читал бы общий config уже во время скана, пока
     # основной поток мог успеть изменить его новым нажатием кнопки
     channels_snapshot = list(config["channels"])
     filters_snapshot = copy.deepcopy(config["filters"])
+    if chat_id is None:
+        chat_id = _active_chat_id
+    timer_key = chat_id if STORAGE_BACKEND == "mongo" else None
     with _scan_lock:
-        if _pending_scan_timer is not None:
-            _pending_scan_timer.cancel()
-        _pending_scan_timer = threading.Timer(
+        existing = _pending_scan_timers.get(timer_key)
+        if existing is not None:
+            existing.cancel()
+        timer = threading.Timer(
             delay,
             _run_recent_scan,
-            kwargs={"channels": channels_snapshot, "filters": filters_snapshot},
+            kwargs={"channels": channels_snapshot, "filters": filters_snapshot, "chat_id": chat_id},
         )
-        _pending_scan_timer.daemon = True
-        _pending_scan_timer.start()
+        timer.daemon = True
+        _pending_scan_timers[timer_key] = timer
+        timer.start()
 
 
 def _post_key(post):
@@ -1782,7 +1885,7 @@ def _post_key(post):
 SENT_POST_IDS_LIMIT = 1000
 
 
-def send_recent_matching_ads(hours=48, channels=None, filters=None):
+def send_recent_matching_ads(hours=48, channels=None, filters=None, chat_id=None):
     # после смены фильтра пользователем — сразу показываем всё подходящее
     # за последние `hours`, а не ждать следующего планового скана каналов
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
@@ -1791,12 +1894,17 @@ def send_recent_matching_ads(hours=48, channels=None, filters=None):
     if filters is None:
         filters = config["filters"]
 
-    # читаем свежим с диска, а не из общего state в памяти — этот вызов
-    # часто идёт из непрерывного слушателя, чей state в памяти мог устареть
-    # за время его работы (плановый скан обновляет sent_post_ids отдельным
-    # процессом). Саму пометку "отправлено" ставит send_digest — здесь
+    # "уже отправлено" — в mongo-режиме личное для каждого чата (см.
+    # send_digest/_mark_as_sent), иначе общее для единственного владельца.
+    # Читаем свежим (не из общего state в памяти) — этот вызов часто идёт
+    # из непрерывного слушателя, чей state в памяти мог устареть за время
+    # его работы. Саму пометку "отправлено" ставит send_digest — здесь
     # только фильтруем то, что уже отправлялось раньше
-    sent_ids_set = set(load_json(STATE_PATH, {}).get("sent_post_ids", []))
+    if STORAGE_BACKEND == "mongo" and chat_id is not None:
+        user_doc = _mongo_collection().find_one({"_id": f"user:{chat_id}"}) or {}
+        sent_ids_set = set(user_doc.get("sent_post_ids", []))
+    else:
+        sent_ids_set = set(load_json(STATE_PATH, {}).get("sent_post_ids", []))
 
     matches = []
     seen_word_lists = []
@@ -1821,18 +1929,20 @@ def send_recent_matching_ads(hours=48, channels=None, filters=None):
             matches.append(post)
 
     if not matches:
-        send_telegram_message(f"По новому фильтру за последние {hours} ч. подходящих объявлений не нашлось.")
+        send_telegram_message(f"По новому фильтру за последние {hours} ч. подходящих объявлений не нашлось.", chat_id=chat_id)
         return
 
-    send_telegram_message(f"По новому фильтру за последние {hours} ч. нашлось: {len(matches)}")
-    send_digest(matches)
+    send_telegram_message(f"По новому фильтру за последние {hours} ч. нашлось: {len(matches)}", chat_id=chat_id)
+    send_digest(matches, chat_id=chat_id)
 
 
-def fetch_new_posts(channels, filters):
+def fetch_new_posts_raw(channels):
+    """Собирает новые посты по всем каналам с последнего скана — общий для
+    ВСЕХ пользователей курсор (last_ids) и общая же дедупликация по
+    содержанию (seen_word_lists): сами посты загружаются один раз, а под
+    фильтр/историю "уже отправлено" конкретного пользователя они
+    подгоняются отдельно, при рассылке (см. /scan в mongo-режиме)."""
     results = []
-    # читаем свежим с диска на случай, если непрерывный слушатель (другой
-    # процесс) успел что-то обновить в state.json уже после запуска этого
-    # процесса
     fresh_state = load_json(STATE_PATH, {"last_ids": {}})
     last_ids = dict(fresh_state.get("last_ids", {}))
     # ограничиваем окно сравнения последними ~300 объявлениями —
@@ -1840,9 +1950,6 @@ def fetch_new_posts(channels, filters):
     # и не даёт файлу состояния разрастаться
     seen_word_lists = fresh_state.get("seen_word_lists", [])[-300:]
     new_word_lists = []
-    # саму пометку "отправлено" ставит send_digest — здесь только
-    # фильтруем то, что уже отправлялось раньше (любым путём)
-    sent_ids_set = set(fresh_state.get("sent_post_ids", []))
 
     for channel in channels:
         try:
@@ -1859,14 +1966,6 @@ def fetch_new_posts(channels, filters):
                 continue
             max_id_seen = max(max_id_seen, post["id"])
 
-            if not matches_filters(post["text"], filters, has_photos=bool(post.get("photos"))):
-                continue
-
-            if _post_key(post) in sent_ids_set:
-                # уже отправляли этот пост через ручное "Применить" —
-                # плановый скан не должен присылать его снова
-                continue
-
             words = extract_signature_words(post["text"])
             if is_duplicate(words, seen_word_lists + new_word_lists):
                 # похожее объявление уже присылали из другого канала
@@ -1881,6 +1980,24 @@ def fetch_new_posts(channels, filters):
         last_ids=last_ids,
         seen_word_lists=(seen_word_lists + new_word_lists)[-300:],
     )
+    return results
+
+
+def fetch_new_posts(channels, filters):
+    # тонкая обёртка над fetch_new_posts_raw для однопользовательского
+    # (файлового) режима — фильтрация и проверка "уже отправлено" сразу в
+    # один проход, как и было исторически до многопользовательского режима
+    raw = fetch_new_posts_raw(channels)
+    sent_ids_set = set(load_json(STATE_PATH, {}).get("sent_post_ids", []))
+    results = []
+    for post in raw:
+        if not matches_filters(post["text"], filters, has_photos=bool(post.get("photos"))):
+            continue
+        if _post_key(post) in sent_ids_set:
+            # уже отправляли этот пост через ручное "Применить" —
+            # плановый скан не должен присылать его снова
+            continue
+        results.append(post)
     return results
 
 
@@ -1987,7 +2104,7 @@ def format_post_message(p):
 TELEGRAM_CAPTION_LIMIT = 1024
 
 
-def _mark_as_sent(posts):
+def _mark_as_sent(posts, chat_id=None):
     # помечаем посты отправленными ЗДЕСЬ, внутри send_digest, а не в коде,
     # который её вызывает — раньше это делали отдельно fetch_new_posts и
     # send_recent_matching_ads, и любой другой вызов send_digest (например,
@@ -1998,13 +2115,6 @@ def _mark_as_sent(posts):
         return
     keys = [_post_key(p) for p in posts]
 
-    # чтение текущего sent_post_ids, вычисление новых ключей и запись — всё
-    # под одной блокировкой (_update_state_locked), а не раздельными load_json
-    # + save_state с промежутком между ними. Раньше между этим чтением и
-    # записью мог успеть отработать другой процесс (плановый скан RoomBot и
-    # слушатель кнопки "Применить" — два независимых процесса) — тогда его
-    # только что добавленные id стирались следующей записью отсюда, пост
-    # "забывался" отправленным и уходил повторно
     def _apply(fresh):
         sent_ids_list = fresh.get("sent_post_ids", [])
         sent_ids_set = set(sent_ids_list)
@@ -2012,10 +2122,25 @@ def _mark_as_sent(posts):
         if new_keys:
             fresh["sent_post_ids"] = (sent_ids_list + new_keys)[-SENT_POST_IDS_LIMIT:]
 
+    if STORAGE_BACKEND == "mongo" and chat_id is not None:
+        # многопользовательский режим — "уже отправлено" считается ОТДЕЛЬНО
+        # для каждого чата (у разных людей разные фильтры и, соответственно,
+        # разная история того, что им уже прислали), поэтому пишем в личный
+        # документ пользователя, а не в общий "state"
+        _mongo_update_locked(f"user:{chat_id}", _user_doc_default(chat_id), _apply)
+        return
+
+    # чтение текущего sent_post_ids, вычисление новых ключей и запись — всё
+    # под одной блокировкой (_update_state_locked), а не раздельными load_json
+    # + save_state с промежутком между ними. Раньше между этим чтением и
+    # записью мог успеть отработать другой процесс (плановый скан RoomBot и
+    # слушатель кнопки "Применить" — два независимых процесса) — тогда его
+    # только что добавленные id стирались следующей записью отсюда, пост
+    # "забывался" отправленным и уходил повторно
     _update_state_locked(_apply)
 
 
-def send_digest(posts):
+def send_digest(posts, chat_id=None):
     for p in posts:
         message = format_post_message(p)
         photos = p.get("photos") or []
@@ -2030,11 +2155,11 @@ def send_digest(posts):
             # прикрепляется, но она и так должна оставаться открытой у
             # пользователя, пока он сам её не свернёт
             if fits_caption:
-                if send_telegram_media_group(photos, caption=message, parse_mode="HTML"):
+                if send_telegram_media_group(photos, caption=message, parse_mode="HTML", chat_id=chat_id):
                     continue
             else:
-                if send_telegram_media_group(photos):
-                    send_telegram_message(message, parse_mode="HTML", reply_markup=MAIN_REPLY_KEYBOARD)
+                if send_telegram_media_group(photos, chat_id=chat_id):
+                    send_telegram_message(message, parse_mode="HTML", reply_markup=MAIN_REPLY_KEYBOARD, chat_id=chat_id)
                     continue
             # альбом не отправился (например, все ссылки на файлы устарели) —
             # пробуем как одно фото, а если и оно не выйдет — просто текстом
@@ -2043,13 +2168,13 @@ def send_digest(posts):
         photo_url = photos[0] if photos else None
 
         if photo_url and fits_caption:
-            if send_telegram_photo(photo_url, caption=message, parse_mode="HTML", reply_markup=MAIN_REPLY_KEYBOARD):
+            if send_telegram_photo(photo_url, caption=message, parse_mode="HTML", reply_markup=MAIN_REPLY_KEYBOARD, chat_id=chat_id):
                 continue
             # не получилось с фото (например, ссылка на файл устарела) — шлём текстом
         elif photo_url:
             # текст не влезает в подпись — шлём фото отдельно, а следом полный текст
-            if send_telegram_photo(photo_url):
-                send_telegram_message(message, parse_mode="HTML", reply_markup=MAIN_REPLY_KEYBOARD)
+            if send_telegram_photo(photo_url, chat_id=chat_id):
+                send_telegram_message(message, parse_mode="HTML", reply_markup=MAIN_REPLY_KEYBOARD, chat_id=chat_id)
                 continue
 
         if photo_url:
@@ -2057,9 +2182,9 @@ def send_digest(posts):
             # раньше это проходило совсем незаметно: пост тихо уходил
             # текстом, и по логу нельзя было понять, что фото вообще были
             log(f"Пост {p.get('link')} отправлен без фото — все попытки скачать/отправить не удались")
-        send_telegram_message(message, parse_mode="HTML", reply_markup=MAIN_REPLY_KEYBOARD)
+        send_telegram_message(message, parse_mode="HTML", reply_markup=MAIN_REPLY_KEYBOARD, chat_id=chat_id)
 
-    _mark_as_sent(posts)
+    _mark_as_sent(posts, chat_id=chat_id)
 
 
 def _telegram_api(method, data=None, files=None, timeout=15):
@@ -2078,11 +2203,21 @@ def _telegram_api(method, data=None, files=None, timeout=15):
         return None
 
 
-def send_telegram_message(text, parse_mode=None, reply_markup=None):
+def _default_chat_id():
+    # многопользовательский (mongo) режим: адресат — тот, чей апдейт сейчас
+    # обрабатывается (см. _run_for_user/_active_chat_id) или кому явно
+    # адресован фоновый скан (см. chat_id= в send_recent_matching_ads и
+    # т.п.). Файловый однопользовательский режим — как и раньше, всегда
+    # единственный владелец
+    return _active_chat_id or MY_CHAT_ID
+
+
+def send_telegram_message(text, parse_mode=None, reply_markup=None, chat_id=None):
     # без disable_web_page_preview на ссылку "Источник" Telegram сам
     # подтягивает большое превью с фото и текстом исходного канала — оно
     # перекрывает нашу карточку
-    data = {"chat_id": MY_CHAT_ID, "text": text, "disable_web_page_preview": True}
+    chat_id = chat_id if chat_id is not None else _default_chat_id()
+    data = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
     if parse_mode:
         data["parse_mode"] = parse_mode
     if reply_markup:
@@ -2145,8 +2280,9 @@ def _download_image(photo_url, label):
     return None
 
 
-def send_telegram_photo(photo_url, caption=None, parse_mode=None, reply_markup=None):
-    data = {"chat_id": MY_CHAT_ID}
+def send_telegram_photo(photo_url, caption=None, parse_mode=None, reply_markup=None, chat_id=None):
+    chat_id = chat_id if chat_id is not None else _default_chat_id()
+    data = {"chat_id": chat_id}
     if caption:
         data["caption"] = caption
     if parse_mode:
@@ -2160,10 +2296,11 @@ def send_telegram_photo(photo_url, caption=None, parse_mode=None, reply_markup=N
     return _telegram_api("sendPhoto", data=data, files=files, timeout=20) is not None
 
 
-def send_telegram_photo_file(path, caption=None, parse_mode=None, reply_markup=None):
+def send_telegram_photo_file(path, caption=None, parse_mode=None, reply_markup=None, chat_id=None):
     # для локальных картинок бота (например обложка приветствия) — файл
     # уже лежит на диске рядом со скриптом, скачивать по URL не нужно
-    data = {"chat_id": MY_CHAT_ID}
+    chat_id = chat_id if chat_id is not None else _default_chat_id()
+    data = {"chat_id": chat_id}
     if caption:
         data["caption"] = caption
     if parse_mode:
@@ -2180,8 +2317,9 @@ def send_telegram_photo_file(path, caption=None, parse_mode=None, reply_markup=N
     return _telegram_api("sendPhoto", data=data, files=files, timeout=20) is not None
 
 
-def send_telegram_media_group(photo_urls, caption=None, parse_mode=None):
+def send_telegram_media_group(photo_urls, caption=None, parse_mode=None, chat_id=None):
     # Telegram принимает максимум 10 фото в одной группе
+    chat_id = chat_id if chat_id is not None else _default_chat_id()
     photo_urls = photo_urls[:10]
 
     files = {}
@@ -2202,7 +2340,7 @@ def send_telegram_media_group(photo_urls, caption=None, parse_mode=None):
     if not media:
         return False
 
-    data = {"chat_id": MY_CHAT_ID, "media": json.dumps(media)}
+    data = {"chat_id": chat_id, "media": json.dumps(media)}
     return _telegram_api("sendMediaGroup", data=data, files=files, timeout=40) is not None
 
 
@@ -2357,7 +2495,10 @@ def handle_callback_query(cq):
     data = cq.get("data", "")
     message = cq.get("message") or {}
     chat_id = str((message.get("chat") or {}).get("id", ""))
-    if chat_id != str(MY_CHAT_ID):
+    # в mongo-режиме (многопользовательский бот) отвечаем любому чату —
+    # ограничение на MY_CHAT_ID имеет смысл только в файловом
+    # однопользовательском режиме (Windows/VM)
+    if STORAGE_BACKEND != "mongo" and chat_id != str(MY_CHAT_ID):
         return
 
     apply_requested = False
@@ -2386,7 +2527,7 @@ def handle_callback_query(cq):
         else:
             types.append(t)
         config["filters"]["property_types"] = types
-        save_json(CONFIG_PATH, config)
+        save_filters()
         answer_callback_query(cq["id"])
         if message_id:
             edit_message_reply_markup(chat_id, message_id, build_wizard_type_keyboard())
@@ -2407,7 +2548,7 @@ def handle_callback_query(cq):
         else:
             ranges.append((lo, hi))
         config["filters"]["price_ranges"] = [list(r) for r in ranges]
-        save_json(CONFIG_PATH, config)
+        save_filters()
         answer_callback_query(cq["id"])
         if message_id:
             edit_message_reply_markup(chat_id, message_id, build_wizard_price_keyboard())
@@ -2428,7 +2569,7 @@ def handle_callback_query(cq):
         else:
             okrugs.append(o)
         config["filters"]["okrugs"] = okrugs
-        save_json(CONFIG_PATH, config)
+        save_filters()
         answer_callback_query(cq["id"])
         if message_id:
             edit_message_reply_markup(chat_id, message_id, build_wizard_okrug_keyboard())
@@ -2443,7 +2584,7 @@ def handle_callback_query(cq):
                 "Поменять фильтры можно в любой момент кнопкой ⚙️ снизу.",
             )
         send_telegram_message("Кнопки для дальнейшей настройки — снизу.", reply_markup=MAIN_REPLY_KEYBOARD)
-        _schedule_recent_scan(delay=0.5)
+        _schedule_recent_scan(delay=0.5, chat_id=chat_id)
         return
 
     if data.startswith("fb"):
@@ -2455,7 +2596,7 @@ def handle_callback_query(cq):
         else:
             ranges.append((lo, hi))
         config["filters"]["price_ranges"] = [list(r) for r in ranges]
-        save_json(CONFIG_PATH, config)
+        save_filters()
 
     elif data.startswith("ft"):
         idx = int(data[2:])
@@ -2466,7 +2607,7 @@ def handle_callback_query(cq):
         else:
             types.append(t)
         config["filters"]["property_types"] = types
-        save_json(CONFIG_PATH, config)
+        save_filters()
 
     elif data.startswith("fo"):
         idx = int(data[2:])
@@ -2477,13 +2618,13 @@ def handle_callback_query(cq):
         else:
             okrugs.append(o)
         config["filters"]["okrugs"] = okrugs
-        save_json(CONFIG_PATH, config)
+        save_filters()
 
     elif data == "freset":
         config["filters"]["price_ranges"] = []
         config["filters"]["property_types"] = []
         config["filters"]["okrugs"] = []
-        save_json(CONFIG_PATH, config)
+        save_filters()
 
     elif data == "fapply":
         # выбор галочек сам по себе поиск не запускает — только явное
@@ -2500,7 +2641,7 @@ def handle_callback_query(cq):
         send_telegram_message("Фильтры применены. Ожидайте новые объявления")
 
     if apply_requested:
-        _schedule_recent_scan(delay=0.5)
+        _schedule_recent_scan(delay=0.5, chat_id=chat_id)
 
 
 # ==================== КОМАНДЫ ИЗ TELEGRAM ====================
@@ -2550,7 +2691,7 @@ def handle_command(text):
         config["filters"]["price_ranges"] = []
         config["filters"]["property_types"] = []
         config["filters"]["okrugs"] = []
-        save_json(CONFIG_PATH, config)
+        save_filters()
         send_telegram_message("Бюджет, тип жилья и округ сброшены.")
         return
 
@@ -2587,7 +2728,7 @@ def handle_command(text):
             return
         config["filters"]["price_min"] = int(nums[0])
         config["filters"]["price_max"] = int(nums[1])
-        save_json(CONFIG_PATH, config)
+        save_filters()
         send_telegram_message(f"Готово: цена от {nums[0]} до {nums[1]} руб")
         return
 
@@ -2596,14 +2737,14 @@ def handle_command(text):
             send_telegram_message("Формат: /metro минуты, например /metro 20")
             return
         config["filters"]["metro_max_minutes"] = int(arg)
-        save_json(CONFIG_PATH, config)
+        save_filters()
         send_telegram_message(f"Готово: метро до {arg} мин. пешком")
         return
 
     if cmd == "/rooms":
         if arg.strip() == "0":
             config["filters"]["rooms"] = []
-            save_json(CONFIG_PATH, config)
+            save_filters()
             send_telegram_message("Готово: фильтр по числу комнат сброшен (подходит любое)")
             return
         nums = [n.strip() for n in arg.split(",") if n.strip()]
@@ -2611,14 +2752,14 @@ def handle_command(text):
             send_telegram_message("Формат: /rooms 1,2 (или /rooms 0, чтобы сбросить)")
             return
         config["filters"]["rooms"] = [int(n) for n in nums]
-        save_json(CONFIG_PATH, config)
+        save_filters()
         send_telegram_message("Готово: подходящее число комнат — " + ", ".join(nums))
         return
 
     if cmd == "/districts":
         if arg.strip() == "0":
             config["filters"]["districts"] = []
-            save_json(CONFIG_PATH, config)
+            save_filters()
             send_telegram_message("Готово: фильтр по районам сброшен (подходит любой)")
             return
         if not arg:
@@ -2626,7 +2767,7 @@ def handle_command(text):
             return
         districts = [d.strip() for d in arg.split(",") if d.strip()]
         config["filters"]["districts"] = districts
-        save_json(CONFIG_PATH, config)
+        save_filters()
         send_telegram_message("Готово: районы — " + ", ".join(districts))
         return
 
@@ -2636,7 +2777,7 @@ def handle_command(text):
             return
         words = [w.strip() for w in arg.split(",") if w.strip()]
         config["filters"]["keywords_include"] = words
-        save_json(CONFIG_PATH, config)
+        save_filters()
         send_telegram_message("Готово: ключевые слова — " + ", ".join(words))
         return
 
@@ -2646,29 +2787,35 @@ def handle_command(text):
             return
         words = [w.strip() for w in arg.split(",") if w.strip()]
         config["filters"]["keywords_exclude"] = words
-        save_json(CONFIG_PATH, config)
+        save_filters()
         send_telegram_message("Готово: слова-исключения — " + ", ".join(words))
         return
 
     if cmd == "/addchannel":
+        if STORAGE_BACKEND == "mongo" and str(_active_chat_id) != str(MY_CHAT_ID):
+            send_telegram_message("Эта команда доступна только владельцу бота")
+            return
         if not arg:
             send_telegram_message("Формат: /addchannel имя_канала")
             return
         channel = arg.lstrip("@").strip()
         if channel not in config["channels"]:
             config["channels"].append(channel)
-            save_json(CONFIG_PATH, config)
+            save_channels()
         send_telegram_message(f"Готово: канал {channel} добавлен")
         return
 
     if cmd == "/removechannel":
+        if STORAGE_BACKEND == "mongo" and str(_active_chat_id) != str(MY_CHAT_ID):
+            send_telegram_message("Эта команда доступна только владельцу бота")
+            return
         if not arg:
             send_telegram_message("Формат: /removechannel имя_канала")
             return
         channel = arg.lstrip("@").strip()
         if channel in config["channels"]:
             config["channels"].remove(channel)
-            save_json(CONFIG_PATH, config)
+            save_channels()
             send_telegram_message(f"Готово: канал {channel} убран")
         else:
             send_telegram_message(f"Канал {channel} не найден в списке")
@@ -2702,19 +2849,7 @@ def handle_command(text):
     # неизвестная команда/обычное сообщение не по теме — молча игнорируем
 
 
-def handle_update(upd):
-    cq = upd.get("callback_query")
-    if cq:
-        handle_callback_query(cq)
-        return
-
-    msg = upd.get("message")
-    if not msg:
-        return
-    chat_id = str(msg["chat"]["id"])
-    if chat_id != str(MY_CHAT_ID):
-        return  # игнорируем сообщения не из твоего чата
-
+def _handle_message(msg):
     # временный помощник: если прислали/переслали кастомный эмодзи (нужно
     # для веток метро) — сохраняем его custom_emoji_id в файл (раньше id
     # только отправлялся в чат и терялся, если не переписать вручную) и
@@ -2774,6 +2909,56 @@ def handle_update(upd):
     text = msg["text"].strip()
     if text.startswith("/") or text in (FILTERS_MENU_BUTTON, FILTERS_RESET_BUTTON):
         handle_command(text)
+
+
+def _run_for_user(chat_id, fn):
+    # mongo-режим = многопользовательский бот: сообщение/кнопка может
+    # прийти от кого угодно, а вся логика команд написана в расчёте на
+    # ОДИН общий config["filters"]. На время обработки этого конкретного
+    # апдейта подставляем в config["filters"] личные фильтры именно этого
+    # чата (см. _load_user_filters/save_filters) и запоминаем его как
+    # "текущего" в _active_chat_id — send_telegram_message и её соседи
+    # используют его как адресата по умолчанию. Всё под одним общим
+    # замком: бот не рассчитан на большую параллельную нагрузку, а эти
+    # общие переменные не потокобезопасны сами по себе
+    global config, _active_chat_id
+    with _multiuser_lock:
+        _active_chat_id = chat_id
+        config["filters"] = _load_user_filters(chat_id)
+        try:
+            if _ensure_user_registered(chat_id):
+                # новый пользователь — показываем приветствие/мастер вместо
+                # того, что он реально прислал (даже если это была не
+                # команда /start, а просто любое первое сообщение боту)
+                handle_command("/start")
+            else:
+                fn()
+        finally:
+            _active_chat_id = None
+
+
+def handle_update(upd):
+    cq = upd.get("callback_query")
+    if cq:
+        chat_id = str(((cq.get("message") or {}).get("chat") or {}).get("id", ""))
+        if STORAGE_BACKEND == "mongo":
+            _run_for_user(chat_id, lambda: handle_callback_query(cq))
+        else:
+            handle_callback_query(cq)
+        return
+
+    msg = upd.get("message")
+    if not msg:
+        return
+    chat_id = str(msg["chat"]["id"])
+
+    if STORAGE_BACKEND == "mongo":
+        _run_for_user(chat_id, lambda: _handle_message(msg))
+        return
+
+    if chat_id != str(MY_CHAT_ID):
+        return  # файловый однопользовательский режим — игнорируем чужие сообщения
+    _handle_message(msg)
 
 
 def _process_update_batch(updates):
@@ -2950,13 +3135,38 @@ def _telegram_webhook(secret):
     return "ok", 200
 
 
+def _run_scan_for_all_users():
+    # многопользовательский (mongo) режим: посты по каналам загружаются
+    # ОДИН раз на всех (fetch_new_posts_raw — общий курсор last_ids и общая
+    # дедупликация по содержанию), а дальше каждый зарегистрированный чат
+    # получает только то, что подходит под ЕГО фильтры и чего ЕМУ ещё не
+    # присылали (у каждого свой sent_post_ids)
+    raw_posts = fetch_new_posts_raw(config["channels"])
+    if not raw_posts:
+        return
+    for chat_id in _all_registered_chat_ids():
+        user_doc = _mongo_collection().find_one({"_id": f"user:{chat_id}"}) or {}
+        user_filters = user_doc.get("filters") or copy.deepcopy(DEFAULT_FILTERS)
+        sent_ids_set = set(user_doc.get("sent_post_ids", []))
+        matches = [
+            p for p in raw_posts
+            if matches_filters(p["text"], user_filters, has_photos=bool(p.get("photos")))
+            and _post_key(p) not in sent_ids_set
+        ]
+        if matches:
+            send_digest(matches, chat_id=chat_id)
+
+
 @app.post("/scan")
 def _scan_endpoint():
     if not SCAN_SECRET or request.headers.get("X-Scan-Secret") != SCAN_SECRET:
         return "forbidden", 403
     try:
-        posts = fetch_new_posts(config["channels"], config["filters"])
-        send_digest(posts)
+        if STORAGE_BACKEND == "mongo":
+            _run_scan_for_all_users()
+        else:
+            posts = fetch_new_posts(config["channels"], config["filters"])
+            send_digest(posts)
     except Exception as e:
         log(f"Ошибка планового скана (webhook-режим): {e}")
         return "error", 500
