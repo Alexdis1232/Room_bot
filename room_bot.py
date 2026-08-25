@@ -16,6 +16,7 @@ from urllib.parse import quote
 
 import requests
 from bs4 import BeautifulSoup
+from flask import Flask, request
 
 # ==================== НАСТРОЙКИ ====================
 
@@ -29,6 +30,23 @@ STATE_PATH = os.path.join(os.path.dirname(__file__), "state.json")
 STATE_LOCK_PATH = STATE_PATH + ".lock"
 LOG_PATH = os.path.join(os.path.dirname(__file__), "bot.log")
 EMOJI_LOG_PATH = os.path.join(os.path.dirname(__file__), "emoji_ids.log")
+
+# "file" (по умолчанию) — как на Windows/VM: config.json/state.json прямо
+# на диске рядом со скриптом. "mongo" — для хостинга без гарантированно
+# постоянного диска (например Render free tier) состояние живёт в MongoDB
+# Atlas вместо файлов; переключается одной переменной окружения, остальной
+# код (вся бизнес-логика, фильтры, дедупликация) работает одинаково в обоих
+# режимах — разница только в том, откуда load_json/save_json читают/пишут.
+STORAGE_BACKEND = os.environ.get("ROOM_BOT_STORAGE", "file")
+MONGODB_URI = os.environ.get("MONGODB_URI", "")
+MONGODB_DB_NAME = os.environ.get("MONGODB_DB_NAME", "room_bot")
+
+# gunicorn на Render импортирует именно этот объект (см. Dockerfile:
+# "room_bot:app") и сам поднимает HTTP-сервер — создание Flask-приложения
+# само по себе не запускает сервер и не мешает обычному CLI-режиму
+# (Windows/VM), поэтому объект создаём безусловно, а не только в
+# webhook-режиме
+app = Flask(__name__)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -67,7 +85,34 @@ def log(msg):
 
 # ==================== ЗАГРУЗКА КОНФИГА ====================
 
+_mongo_client = None
+
+
+def _mongo_collection():
+    # ленивый импорт/подключение — pymongo не установлен на Windows-машине
+    # (там STORAGE_BACKEND всегда "file", эта функция там ни разу не
+    # вызывается), поэтому импорт на верхнем уровне модуля сломал бы
+    # существующий Windows-деплой без единой лишней зависимости в венве
+    global _mongo_client
+    if _mongo_client is None:
+        from pymongo import MongoClient
+        _mongo_client = MongoClient(MONGODB_URI)
+    return _mongo_client[MONGODB_DB_NAME]["documents"]
+
+
+def _mongo_doc_id(path):
+    # "config.json" -> "config", "state.json" -> "state" — единственные два
+    # пути, с которыми реально вызывают load_json/save_json
+    return os.path.splitext(os.path.basename(path))[0]
+
+
 def load_json(path, default):
+    if STORAGE_BACKEND == "mongo":
+        doc = _mongo_collection().find_one({"_id": _mongo_doc_id(path)})
+        if doc is None:
+            return copy.deepcopy(default)
+        doc.pop("_id", None)
+        return doc
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -75,6 +120,11 @@ def load_json(path, default):
 
 
 def save_json(path, data):
+    if STORAGE_BACKEND == "mongo":
+        doc = dict(data)
+        doc["_id"] = _mongo_doc_id(path)
+        _mongo_collection().replace_one({"_id": doc["_id"]}, doc, upsert=True)
+        return
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -95,14 +145,29 @@ def _unlock_file(f):
         fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
+_state_update_lock = threading.Lock()
+
+
 def _update_state_locked(update_fn):
     # то же, что save_state ниже, но для случаев, когда новое значение поля
-    # зависит от его же ТЕКУЩЕГО содержимого на диске (например, дописать
-    # новые id в sent_post_ids), а не просто заменяет поле целиком.
-    # update_fn получает свежепрочитанный с диска словарь и мутирует его на
-    # месте — чтение, изменение и запись происходят под ОДНОЙ и той же
-    # блокировкой, без промежутка, в котором другой процесс мог бы вклиниться
+    # зависит от его же ТЕКУЩЕГО содержимого (например, дописать новые id в
+    # sent_post_ids), а не просто заменяет поле целиком. update_fn получает
+    # свежепрочитанный словарь и мутирует его на месте — чтение, изменение
+    # и запись происходят под ОДНОЙ и той же блокировкой, без промежутка, в
+    # котором другой процесс/поток мог бы вклиниться.
+    #
+    # В mongo-режиме отдельного файла блокировки нет и не нужен: там нет
+    # двух независимых ОС-процессов (как RoomBot+RoomBotListener на Windows),
+    # весь webhook-сервис — один gunicorn-процесс, поэтому обычного
+    # threading.Lock достаточно, чтобы сериализовать конкурентные потоки
     global state
+    if STORAGE_BACKEND == "mongo":
+        with _state_update_lock:
+            fresh = load_json(STATE_PATH, {"last_ids": {}})
+            update_fn(fresh)
+            save_json(STATE_PATH, fresh)
+            state = fresh
+        return state
     with open(STATE_LOCK_PATH, "a+b") as lock_file:
         _lock_file(lock_file)
         try:
@@ -2865,6 +2930,53 @@ def listen_loop():
         except Exception as e:
             log(f"Ошибка в цикле прослушивания: {e}")
             time.sleep(5)
+
+
+# ==================== WEB-РЕЖИМ (Render/любой webhook-хостинг) ====================
+# Альтернатива --listen/Планировщику для хостинга без постоянно работающего
+# процесса (Render free tier засыпает при простое). Вместо long-polling
+# Telegram сам стучится в /telegram-webhook при новом апдейте — это и
+# "будит" уснувший сервис; вместо задачи RoomBot внешний cron (например
+# cron-job.org, тоже бесплатно) раз в 15 минут дёргает /scan. Работает,
+# только когда STORAGE_BACKEND="mongo" — на файловом хранилище (Windows/VM)
+# этот код просто не запускается ни при каком поведении gunicorn: routes
+# зарегистрированы всегда, но их никто не дёргает, если процесс никогда не
+# поднимают через `gunicorn room_bot:app`.
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+SCAN_SECRET = os.environ.get("SCAN_SECRET", "")
+
+
+@app.get("/")
+def _health():
+    return "room_bot is running", 200
+
+
+@app.post("/telegram-webhook/<secret>")
+def _telegram_webhook(secret):
+    # сравнение через os.urandom-подобную защиту от timing-атак избыточно
+    # для личного бота с одним пользователем, но секрет всё равно проверяем
+    # строго — иначе кто угодно, узнавший URL, мог бы слать боту "апдейты"
+    if not TELEGRAM_WEBHOOK_SECRET or secret != TELEGRAM_WEBHOOK_SECRET:
+        return "forbidden", 403
+    update = request.get_json(silent=True) or {}
+    try:
+        _process_update_batch([update])
+    except Exception as e:
+        log(f"Ошибка обработки вебхука: {e}")
+    return "ok", 200
+
+
+@app.post("/scan")
+def _scan_endpoint():
+    if not SCAN_SECRET or request.headers.get("X-Scan-Secret") != SCAN_SECRET:
+        return "forbidden", 403
+    try:
+        posts = fetch_new_posts(config["channels"], config["filters"])
+        send_digest(posts)
+    except Exception as e:
+        log(f"Ошибка планового скана (webhook-режим): {e}")
+        return "error", 500
+    return "ok", 200
 
 
 # ==================== ОСНОВНОЙ ЗАПУСК ====================

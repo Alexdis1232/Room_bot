@@ -1,0 +1,16 @@
+.git/
+.claude/
+deploy/
+tests/
+__pycache__/
+*.pyc
+.pytest_cache/
+state.json
+state.json.lock
+bot.log
+emoji_ids.log
+*.env
+out*.txt
+README.md
+TECH_DEBT_AUDIT.md
+setup_room_bot.ps1

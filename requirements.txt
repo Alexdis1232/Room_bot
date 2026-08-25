@@ -1,2 +1,5 @@
 requests~=2.34
 beautifulsoup4~=4.15
+flask~=3.1
+gunicorn~=23.0
+pymongo~=4.10
