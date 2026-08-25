@@ -3120,32 +3120,6 @@ def _health():
     return "room_bot is running", 200
 
 
-@app.get("/debug/<secret>")
-def _debug(secret):
-    # временный диагностический эндпоинт — показывает состояние сразу в
-    # ответе, без ожидания логов хостинга (которые буферизуются и приходят
-    # с задержкой). Тот же секрет, что и для /scan — не заводим отдельный
-    if not SCAN_SECRET or secret != SCAN_SECRET:
-        return "forbidden", 403
-    info = {"storage_backend": STORAGE_BACKEND}
-    try:
-        info["mongo_ping"] = _mongo_collection().database.client.admin.command("ping")
-        info["registered_users"] = _all_registered_chat_ids()
-        info["channels_count"] = len(config.get("channels", []))
-    except Exception as e:
-        info["mongo_error"] = f"{type(e).__name__}: {e}"
-    try:
-        test_chat_id = "999900095"
-        is_new = _ensure_user_registered(test_chat_id)
-        info["test_registration_ok"] = True
-        info["test_registration_was_new"] = is_new
-        _mongo_collection().delete_many({"_id": f"user:{test_chat_id}"})
-        _mongo_collection().update_one({"_id": "users"}, {"$pull": {"chat_ids": test_chat_id}})
-    except Exception as e:
-        info["test_registration_error"] = f"{type(e).__name__}: {e}"
-    return info, 200
-
-
 @app.post("/telegram-webhook/<secret>")
 def _telegram_webhook(secret):
     # сравнение через os.urandom-подобную защиту от timing-атак избыточно
