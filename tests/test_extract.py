@@ -155,7 +155,9 @@ def test_negation_does_not_leak_across_newline():
     # предложения, и залог ошибочно помечался как "без залога"
     text = "По цене: 28к КУ включены\nЗалог: 5к можно разбить"
     extras = rb.extract_price_extras(text)
-    assert "залог" in extras
+    # "5к" рядом с "Залог" распознаётся как сумма (5 000 руб), а не просто
+    # голый лейбл — см. _AMOUNT_NEAR_KEYWORD_RE
+    assert "5 000 руб залог" in extras
     assert "без залога" not in extras
 
 

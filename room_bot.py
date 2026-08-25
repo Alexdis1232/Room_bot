@@ -490,13 +490,31 @@ _SENTENCE_BOUNDARY_RE = re.compile(r"(?<!\d)\.(?!\d)|,|\n")
 _JOIN_SEPARATOR_RE = re.compile(r"\+|плюс", re.IGNORECASE)
 
 
+# число рядом с ключевым словом (см. _find_amount_near_keyword) — либо
+# полная сумма ("35 000", "35000"), либо сокращённая запись тысяч ("35
+# тыс", "35к") — раньше комиссия/залог/коммуналка вида "Комиссия 35 тыс."
+# находились ПО НАЛИЧИЮ слова, но без суммы (num_re ловил только полные
+# числа от 3 цифр), и в карточке показывалось голое "комиссия" без суммы,
+# хотя она была прямо в тексте — реальный случай: t.me/Find_flat/41923
+_AMOUNT_NEAR_KEYWORD_RE = re.compile(
+    r"(" + _PRICE_NUM + r")"
+    r"|(\d{1,3})\s?(?:тыс\w*|к\b)",
+    re.IGNORECASE,
+)
+
+
+def _amount_near_keyword_value(m):
+    if m.group(1) is not None:
+        return _price_to_int(m.group(1))
+    return int(m.group(2)) * 1000
+
+
 def _find_amount_near_keyword(text, keyword_re, window=20):
-    # ищет ЧИСЛО рядом с ключевым словом — сначала после него, потом перед
+    # ищет СУММУ рядом с ключевым словом — сначала после него, потом перед
     # ним, но НЕ дальше границы предложения: иначе легко зацепить число из
     # другого предложения — например саму цену аренды в "90.000₽ +
     # коммунальные услуги" (перед "коммунальные" нет точки, но и числа там
     # для "коммунальные" тоже нет — оно относится к предыдущей части через "+")
-    num_re = re.compile(_PRICE_NUM)
     for km in keyword_re.finditer(text):
         if _is_negated(text, km.start()):
             continue
@@ -505,11 +523,11 @@ def _find_amount_near_keyword(text, keyword_re, window=20):
         boundary = _SENTENCE_BOUNDARY_RE.search(text, km.end(), fwd_end)
         if boundary:
             fwd_end = boundary.start()
-        after = num_re.search(text, km.end(), fwd_end)
+        after = _AMOUNT_NEAR_KEYWORD_RE.search(text, km.end(), fwd_end)
         # число сразу после знака "%" — это доля ("Депозит 100%"), а не
         # сумма в рублях, такое не считаем
         if after and text[after.end():after.end() + 1] != "%":
-            return _price_to_int(after.group(0)), after.span()
+            return _amount_near_keyword_value(after), after.span()
 
         # число перед словом берём только если между ним и словом нет
         # точки/"+"/"плюс" — если есть, это, скорее всего, отдельная сумма
@@ -519,12 +537,12 @@ def _find_amount_near_keyword(text, keyword_re, window=20):
         boundaries = list(_SENTENCE_BOUNDARY_RE.finditer(text, back_start, km.start()))
         if boundaries:
             back_start = boundaries[-1].end()
-        before_matches = list(num_re.finditer(text, back_start, km.start()))
+        before_matches = list(_AMOUNT_NEAR_KEYWORD_RE.finditer(text, back_start, km.start()))
         if before_matches:
             bm = before_matches[-1]
             between = text[bm.end():km.start()]
             if "." not in between and not _JOIN_SEPARATOR_RE.search(between):
-                return _price_to_int(bm.group(0)), bm.span()
+                return _amount_near_keyword_value(bm), bm.span()
     return None
 
 
