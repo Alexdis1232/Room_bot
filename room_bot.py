@@ -1487,6 +1487,18 @@ def extract_contacts(text):
     return ", ".join(result) if result else None
 
 
+def _contact_tokens(text):
+    # тот же набор контактов, что и extract_contacts, но как множество
+    # отдельных токенов (для сравнения "это тот же человек", а не для
+    # показа пользователю) — один и тот же номер/юзернейм в двух постах
+    # почти наверняка значит, что это одно и то же объявление, даже если
+    # оно полностью переписано другими словами (см. _is_same_listing)
+    contacts = extract_contacts(text)
+    if not contacts:
+        return set()
+    return {c.strip().lower() for c in contacts.split(", ") if c.strip()}
+
+
 def _merge_spans(spans):
     spans = sorted(spans)
     merged = []
@@ -1615,10 +1627,28 @@ def similarity(words_a, words_b):
     return intersection / union if union else 0.0
 
 
-def is_duplicate(words, seen_word_lists, threshold=0.6):
-    for seen_words in seen_word_lists:
-        if similarity(words, set(seen_words)) >= threshold:
+def is_duplicate(words, seen_word_lists, threshold=0.6, contacts=None, price=None):
+    # seen_word_lists — либо старые записи (просто список слов, как раньше),
+    # либо новые словари {"words", "contacts", "price"} (см. места, где
+    # список пополняется, например fetch_new_posts_raw) — старый формат
+    # понимаем как раньше, для него доступна только проверка по словам
+    for entry in seen_word_lists:
+        if isinstance(entry, dict):
+            entry_words = set(entry.get("words") or [])
+        else:
+            entry_words = set(entry)
+        if similarity(words, entry_words) >= threshold:
             return True
+        # второй, независимый сигнал: тот же контакт (номер/юзернейм) и та
+        # же цена — почти наверняка то же объявление, даже если оно
+        # полностью переписано другими словами. Совпадение по словам такое
+        # не ловит (см. реальный случай: t.me/flats_for_friend/126693 vs
+        # t.me/Find_flat/42356 — общих слов всего 35%, но контакт и цена
+        # идентичны)
+        if isinstance(entry, dict) and contacts and price is not None:
+            entry_contacts = set(entry.get("contacts") or [])
+            if entry_contacts & contacts and entry.get("price") == price:
+                return True
     return False
 
 
@@ -1968,9 +1998,11 @@ def send_recent_matching_ads(hours=48, channels=None, filters=None, chat_id=None
                 # не дублируем его только из-за того, что он снова подошёл
                 continue
             words = extract_signature_words(post["text"])
-            if is_duplicate(words, seen_word_lists):
+            contacts = _contact_tokens(post["text"])
+            price_val = extract_price(post["text"])
+            if is_duplicate(words, seen_word_lists, contacts=contacts, price=price_val):
                 continue
-            seen_word_lists.append(list(words))
+            seen_word_lists.append({"words": list(words), "contacts": list(contacts), "price": price_val})
             matches.append(post)
 
     if not matches:
@@ -2012,11 +2044,13 @@ def fetch_new_posts_raw(channels):
             max_id_seen = max(max_id_seen, post["id"])
 
             words = extract_signature_words(post["text"])
-            if is_duplicate(words, seen_word_lists + new_word_lists):
+            contacts = _contact_tokens(post["text"])
+            price_val = extract_price(post["text"])
+            if is_duplicate(words, seen_word_lists + new_word_lists, contacts=contacts, price=price_val):
                 # похожее объявление уже присылали из другого канала
                 continue
 
-            new_word_lists.append(list(words))
+            new_word_lists.append({"words": list(words), "contacts": list(contacts), "price": price_val})
             results.append(post)
 
         last_ids[channel] = max_id_seen
@@ -2163,7 +2197,14 @@ def _mark_as_sent(posts, chat_id=None):
     # send_recent_matching_ads узнать уже доставленное объявление, даже
     # если оно перепощено в другой канал под другим id (см. её
     # seen_word_lists)
-    new_word_lists = [list(extract_signature_words(p["text"])) for p in posts]
+    new_word_lists = [
+        {
+            "words": list(extract_signature_words(p["text"])),
+            "contacts": list(_contact_tokens(p["text"])),
+            "price": extract_price(p["text"]),
+        }
+        for p in posts
+    ]
 
     def _apply(fresh):
         sent_ids_list = fresh.get("sent_post_ids", [])
@@ -3212,9 +3253,11 @@ def _run_scan_for_all_users():
             if _post_key(p) in sent_ids_set:
                 continue
             words = extract_signature_words(p["text"])
-            if is_duplicate(words, seen_word_lists):
+            contacts = _contact_tokens(p["text"])
+            price_val = extract_price(p["text"])
+            if is_duplicate(words, seen_word_lists, contacts=contacts, price=price_val):
                 continue
-            seen_word_lists.append(list(words))
+            seen_word_lists.append({"words": list(words), "contacts": list(contacts), "price": price_val})
             matches.append(p)
         if matches:
             send_digest(matches, chat_id=chat_id)
