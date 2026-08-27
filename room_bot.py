@@ -1934,15 +1934,25 @@ def send_recent_matching_ads(hours=48, channels=None, filters=None, chat_id=None
     # Читаем свежим (не из общего state в памяти) — этот вызов часто идёт
     # из непрерывного слушателя, чей state в памяти мог устареть за время
     # его работы. Саму пометку "отправлено" ставит send_digest — здесь
-    # только фильтруем то, что уже отправлялось раньше
+    # только фильтруем то, что уже отправлялось раньше.
+    #
+    # seen_word_lists изначально заполняем УЖЕ ДОСТАВЛЕННЫМ этому получателю
+    # содержанием (sent_signature_words), а не начинаем с пустого списка —
+    # иначе повторное нажатие "Применить" (или запуск после планового скана)
+    # не узнавало объявление, которое уже уходило раньше из ДРУГОГО канала
+    # под другим id, и присылало его как будто новое. Точная проверка по id
+    # (sent_ids_set) такое не ловит — это разные посты, просто один и тот
+    # же текст, перепощенный в другой канал
     if STORAGE_BACKEND == "mongo" and chat_id is not None:
         user_doc = _mongo_collection().find_one({"_id": f"user:{chat_id}"}) or {}
         sent_ids_set = set(user_doc.get("sent_post_ids", []))
+        seen_word_lists = list(user_doc.get("sent_signature_words", []))
     else:
-        sent_ids_set = set(load_json(STATE_PATH, {}).get("sent_post_ids", []))
+        fresh_state = load_json(STATE_PATH, {})
+        sent_ids_set = set(fresh_state.get("sent_post_ids", []))
+        seen_word_lists = list(fresh_state.get("sent_signature_words", []))
 
     matches = []
-    seen_word_lists = []
     for channel in channels:
         try:
             posts = fetch_channel_posts_since(channel, cutoff)
@@ -2149,6 +2159,11 @@ def _mark_as_sent(posts, chat_id=None):
     if not posts:
         return
     keys = [_post_key(p) for p in posts]
+    # фингерпринты содержания — вместе с sent_post_ids позволяют
+    # send_recent_matching_ads узнать уже доставленное объявление, даже
+    # если оно перепощено в другой канал под другим id (см. её
+    # seen_word_lists)
+    new_word_lists = [list(extract_signature_words(p["text"])) for p in posts]
 
     def _apply(fresh):
         sent_ids_list = fresh.get("sent_post_ids", [])
@@ -2156,6 +2171,7 @@ def _mark_as_sent(posts, chat_id=None):
         new_keys = [k for k in keys if k not in sent_ids_set]
         if new_keys:
             fresh["sent_post_ids"] = (sent_ids_list + new_keys)[-SENT_POST_IDS_LIMIT:]
+        fresh["sent_signature_words"] = (fresh.get("sent_signature_words", []) + new_word_lists)[-SENT_POST_IDS_LIMIT:]
 
     if STORAGE_BACKEND == "mongo" and chat_id is not None:
         # многопользовательский режим — "уже отправлено" считается ОТДЕЛЬНО
@@ -3183,11 +3199,23 @@ def _run_scan_for_all_users():
         user_doc = _mongo_collection().find_one({"_id": f"user:{chat_id}"}) or {}
         user_filters = user_doc.get("filters") or copy.deepcopy(DEFAULT_FILTERS)
         sent_ids_set = set(user_doc.get("sent_post_ids", []))
-        matches = [
-            p for p in raw_posts
-            if matches_filters(p["text"], user_filters, has_photos=bool(p.get("photos")))
-            and _post_key(p) not in sent_ids_set
-        ]
+        # та же защита от репоста в другой канал, что и в
+        # send_recent_matching_ads — global-дедуп в fetch_new_posts_raw
+        # обычно уже отсеивает такое на уровне сырых постов, но у него
+        # ограниченное окно (последние ~300), так что дублируем проверку
+        # персонально: чего этому конкретному чату уже присылали
+        seen_word_lists = list(user_doc.get("sent_signature_words", []))
+        matches = []
+        for p in raw_posts:
+            if not matches_filters(p["text"], user_filters, has_photos=bool(p.get("photos"))):
+                continue
+            if _post_key(p) in sent_ids_set:
+                continue
+            words = extract_signature_words(p["text"])
+            if is_duplicate(words, seen_word_lists):
+                continue
+            seen_word_lists.append(list(words))
+            matches.append(p)
         if matches:
             send_digest(matches, chat_id=chat_id)
 
