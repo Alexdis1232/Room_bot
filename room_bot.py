@@ -1668,6 +1668,17 @@ TENANT_SEEKING_RE = re.compile(
     re.IGNORECASE,
 )
 
+# бот целиком заточен под Москву (база станций метро, округа, адреса) —
+# явное упоминание другого города в тексте значит, что пост не про Москву,
+# даже если по цене/типу/станции метро он формально подошёл (в СПб тоже
+# есть станция "Пионерская" с тем же названием, что и в Москве — реальный
+# случай: t.me/flats_4_friends/69610, "САНКТ-ПЕТЕРБУРГ..." прошло по всем
+# остальным фильтрам, потому что ничего явно не проверяло город)
+OTHER_CITY_RE = re.compile(
+    r"санкт-?петербург\w*|\bспб\b|\bпитер\w*|\bленинградск\w*\s*облас\w*",
+    re.IGNORECASE,
+)
+
 
 def matches_filters(text, filters, has_photos=False):
     # футеры-ссылки каналов (см. BOILERPLATE_RE) вырезаем ДО проверки
@@ -1676,6 +1687,9 @@ def matches_filters(text, filters, has_photos=False):
     lower = BOILERPLATE_RE.sub(" ", text).lower()
 
     if TENANT_SEEKING_RE.search(lower):
+        return False
+
+    if OTHER_CITY_RE.search(lower):
         return False
 
     if filters["keywords_include"]:
